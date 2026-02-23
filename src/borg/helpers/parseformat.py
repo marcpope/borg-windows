@@ -441,14 +441,32 @@ class Location:
             return ('/.' + p) if relative else p
 
         if is_win32:
+            # Try SSH first (ssh://user@host/path::archive)
+            m = self.ssh_re.match(text)
+            if m:
+                self.proto = m.group('proto')
+                self.user = m.group('user')
+                self._host = m.group('host')
+                self.port = m.group('port') and int(m.group('port')) or None
+                self.path = normpath_special(m.group('path'))
+                self.archive = m.group('archive')
+                return True
+            # Try SCP style (user@host:path::archive)
+            m = self.scp_re.match(text)
+            if m:
+                self.user = m.group('user')
+                self._host = m.group('host')
+                self.path = normpath_special(m.group('path'))
+                self.archive = m.group('archive')
+                self.proto = self._host and 'ssh' or 'file'
+                return True
+            # Fall through to Windows file paths
             m = self.win_file_re.match(text)
             if m:
                 self.proto = 'file'
                 self.path = m.group('path')
                 self.archive = m.group('archive')
                 return True
-
-            # On windows we currently only support windows paths
             return False
 
         m = self.ssh_re.match(text)
