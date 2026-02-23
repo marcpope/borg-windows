@@ -4,16 +4,22 @@ import inspect
 import json
 import logging
 import os
-import select
 import shlex
 import shutil
 import struct
 import sys
 import tempfile
 import textwrap
+import threading
 import time
 import traceback
+from queue import Queue, Empty
 from subprocess import Popen, PIPE
+
+from .platformflags import is_win32
+
+if not is_win32:
+    import select
 
 from . import __version__
 from .compress import Compressor
@@ -578,15 +584,34 @@ class RemoteRepository:
         logger.debug('SSH command line: %s', borg_cmd)
         # we do not want the ssh getting killed by Ctrl-C/SIGINT because it is needed for clean shutdown of borg.
         # borg's SIGINT handler tries to write a checkpoint and requires the remote repo connection.
-        self.p = Popen(borg_cmd, bufsize=0, stdin=PIPE, stdout=PIPE, stderr=PIPE, env=env, preexec_fn=ignore_sigint)
+        if is_win32:
+            # preexec_fn is not supported on Windows; use CREATE_NEW_PROCESS_GROUP instead
+            # to prevent Ctrl+C from propagating to the SSH child process.
+            import subprocess
+            self.p = Popen(borg_cmd, bufsize=0, stdin=PIPE, stdout=PIPE, stderr=PIPE, env=env,
+                           creationflags=subprocess.CREATE_NEW_PROCESS_GROUP)
+        else:
+            self.p = Popen(borg_cmd, bufsize=0, stdin=PIPE, stdout=PIPE, stderr=PIPE, env=env, preexec_fn=ignore_sigint)
         self.stdin_fd = self.p.stdin.fileno()
         self.stdout_fd = self.p.stdout.fileno()
         self.stderr_fd = self.p.stderr.fileno()
-        os.set_blocking(self.stdin_fd, False)
-        os.set_blocking(self.stdout_fd, False)
-        os.set_blocking(self.stderr_fd, False)
-        self.r_fds = [self.stdout_fd, self.stderr_fd]
-        self.x_fds = [self.stdin_fd, self.stdout_fd, self.stderr_fd]
+        if is_win32:
+            # On Windows, select() doesn't work on pipe FDs and os.set_blocking doesn't exist.
+            # Use threaded readers that push data into queues.
+            self._stdout_queue = Queue()
+            self._stderr_queue = Queue()
+            self._stdout_reader = threading.Thread(target=self._pipe_reader,
+                                                   args=(self.p.stdout, self._stdout_queue), daemon=True)
+            self._stderr_reader = threading.Thread(target=self._pipe_reader,
+                                                   args=(self.p.stderr, self._stderr_queue), daemon=True)
+            self._stdout_reader.start()
+            self._stderr_reader.start()
+        else:
+            os.set_blocking(self.stdin_fd, False)
+            os.set_blocking(self.stdout_fd, False)
+            os.set_blocking(self.stderr_fd, False)
+            self.r_fds = [self.stdout_fd, self.stderr_fd]
+            self.x_fds = [self.stdin_fd, self.stdout_fd, self.stderr_fd]
 
         try:
             try:
@@ -641,6 +666,20 @@ This problem will go away as soon as the server has been upgraded to 1.0.7+.
         if self.p:
             self.close()
             assert False, 'cleanup happened in Repository.__del__'
+
+    @staticmethod
+    def _pipe_reader(pipe, queue):
+        """Read from a pipe in a background thread, pushing chunks into a queue."""
+        try:
+            while True:
+                data = pipe.read(BUFSIZE)
+                if not data:
+                    break
+                queue.put(data)
+        except (OSError, ValueError):
+            pass
+        finally:
+            queue.put(None)  # sentinel: EOF
 
     def __repr__(self):
         return f'<{self.__class__.__name__} {self.location.canonical_path()}>'
@@ -869,17 +908,15 @@ This problem will go away as soon as the server has been upgraded to 1.0.7+.
                             handle_error(unpacked)
                         else:
                             yield unpacked[RESULT]
-            if self.to_send or ((calls or self.preload_ids) and len(waiting_for) < MAX_INFLIGHT):
-                w_fds = [self.stdin_fd]
-            else:
-                w_fds = []
-            r, w, x = select.select(self.r_fds, w_fds, self.x_fds, 1)
-            if x:
-                raise Exception('FD exception occurred')
-            for fd in r:
-                if fd is self.stdout_fd:
-                    data = os.read(fd, BUFSIZE)
-                    if not data:
+            if is_win32:
+                # Windows: use threaded queues instead of select() on pipe FDs.
+                # Drain stdout queue.
+                while True:
+                    try:
+                        data = self._stdout_queue.get_nowait()
+                    except Empty:
+                        break
+                    if data is None:
                         raise ConnectionClosed()
                     self.rx_bytes += len(data)
                     self.unpacker.feed(data)
@@ -887,10 +924,8 @@ This problem will go away as soon as the server has been upgraded to 1.0.7+.
                         if isinstance(unpacked, dict):
                             msgid = unpacked[MSGID]
                         elif isinstance(unpacked, tuple) and len(unpacked) == 4:
-                            # The first field 'type' was always 1 and has always been ignored
                             _, msgid, error, res = unpacked
                             if error:
-                                # ignore res, because it is only a fixed string anyway.
                                 unpacked = {MSGID: msgid, b'exception_class': error}
                             else:
                                 unpacked = {MSGID: msgid, RESULT: res}
@@ -898,31 +933,89 @@ This problem will go away as soon as the server has been upgraded to 1.0.7+.
                             raise UnexpectedRPCDataFormatFromServer(data)
                         if msgid in self.ignore_responses:
                             self.ignore_responses.remove(msgid)
-                            # async methods never return values, but may raise exceptions.
                             if b'exception_class' in unpacked:
                                 self.async_responses[msgid] = unpacked
                             else:
-                                # we currently do not have async result values except "None",
-                                # so we do not add them into async_responses.
                                 if unpacked[RESULT] is not None:
                                     self.async_responses[msgid] = unpacked
                         else:
                             self.responses[msgid] = unpacked
-                elif fd is self.stderr_fd:
-                    data = os.read(fd, 32768)
-                    if not data:
+                # Drain stderr queue.
+                while True:
+                    try:
+                        data = self._stderr_queue.get_nowait()
+                    except Empty:
+                        break
+                    if data is None:
                         raise ConnectionClosed()
                     self.rx_bytes += len(data)
-                    # deal with incomplete lines (may appear due to block buffering)
                     if self.stderr_received:
                         data = self.stderr_received + data
                         self.stderr_received = b''
                     lines = data.splitlines(keepends=True)
                     if lines and not lines[-1].endswith((b'\r', b'\n')):
                         self.stderr_received = lines.pop()
-                    # now we have complete lines in <lines> and any partial line in self.stderr_received.
                     for line in lines:
-                        handle_remote_line(line.decode())  # decode late, avoid partial utf-8 sequences
+                        handle_remote_line(line.decode())
+                # If nothing was received, sleep briefly to avoid busy-waiting.
+                if self._stdout_queue.empty() and self._stderr_queue.empty():
+                    time.sleep(0.01)
+                w = self.to_send or ((calls or self.preload_ids) and len(waiting_for) < MAX_INFLIGHT)
+            else:
+                if self.to_send or ((calls or self.preload_ids) and len(waiting_for) < MAX_INFLIGHT):
+                    w_fds = [self.stdin_fd]
+                else:
+                    w_fds = []
+                r, w, x = select.select(self.r_fds, w_fds, self.x_fds, 1)
+                if x:
+                    raise Exception('FD exception occurred')
+                for fd in r:
+                    if fd is self.stdout_fd:
+                        data = os.read(fd, BUFSIZE)
+                        if not data:
+                            raise ConnectionClosed()
+                        self.rx_bytes += len(data)
+                        self.unpacker.feed(data)
+                        for unpacked in self.unpacker:
+                            if isinstance(unpacked, dict):
+                                msgid = unpacked[MSGID]
+                            elif isinstance(unpacked, tuple) and len(unpacked) == 4:
+                                # The first field 'type' was always 1 and has always been ignored
+                                _, msgid, error, res = unpacked
+                                if error:
+                                    # ignore res, because it is only a fixed string anyway.
+                                    unpacked = {MSGID: msgid, b'exception_class': error}
+                                else:
+                                    unpacked = {MSGID: msgid, RESULT: res}
+                            else:
+                                raise UnexpectedRPCDataFormatFromServer(data)
+                            if msgid in self.ignore_responses:
+                                self.ignore_responses.remove(msgid)
+                                # async methods never return values, but may raise exceptions.
+                                if b'exception_class' in unpacked:
+                                    self.async_responses[msgid] = unpacked
+                                else:
+                                    # we currently do not have async result values except "None",
+                                    # so we do not add them into async_responses.
+                                    if unpacked[RESULT] is not None:
+                                        self.async_responses[msgid] = unpacked
+                            else:
+                                self.responses[msgid] = unpacked
+                    elif fd is self.stderr_fd:
+                        data = os.read(fd, 32768)
+                        if not data:
+                            raise ConnectionClosed()
+                        self.rx_bytes += len(data)
+                        # deal with incomplete lines (may appear due to block buffering)
+                        if self.stderr_received:
+                            data = self.stderr_received + data
+                            self.stderr_received = b''
+                        lines = data.splitlines(keepends=True)
+                        if lines and not lines[-1].endswith((b'\r', b'\n')):
+                            self.stderr_received = lines.pop()
+                        # now we have complete lines in <lines> and any partial line in self.stderr_received.
+                        for line in lines:
+                            handle_remote_line(line.decode())  # decode late, avoid partial utf-8 sequences
             if w:
                 while (len(self.to_send) <= maximum_to_send) and (calls or self.preload_ids) and len(waiting_for) < MAX_INFLIGHT:
                     if calls:
@@ -1032,6 +1125,7 @@ This problem will go away as soon as the server has been upgraded to 1.0.7+.
         if self.p:
             self.p.stdin.close()
             self.p.stdout.close()
+            self.p.stderr.close()
             self.p.wait()
             self.p = None
 
