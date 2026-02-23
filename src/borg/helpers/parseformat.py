@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import os.path
+import posixpath
 import re
 import shlex
 import socket
@@ -440,6 +441,13 @@ class Location:
             p = os.path.normpath(p)
             return ('/.' + p) if relative else p
 
+        def normpath_special_remote(p):
+            # Like normpath_special but uses posixpath for remote (Unix) paths,
+            # so forward slashes are preserved even when running on Windows.
+            relative = p.startswith('/./')
+            p = posixpath.normpath(p)
+            return ('/.' + p) if relative else p
+
         if is_win32:
             # Try SSH first (ssh://user@host/path::archive)
             m = self.ssh_re.match(text)
@@ -448,7 +456,7 @@ class Location:
                 self.user = m.group('user')
                 self._host = m.group('host')
                 self.port = m.group('port') and int(m.group('port')) or None
-                self.path = normpath_special(m.group('path'))
+                self.path = normpath_special_remote(m.group('path'))
                 self.archive = m.group('archive')
                 return True
             # Try SCP style (user@host:path::archive)
@@ -456,7 +464,7 @@ class Location:
             if m:
                 self.user = m.group('user')
                 self._host = m.group('host')
-                self.path = normpath_special(m.group('path'))
+                self.path = normpath_special_remote(m.group('path'))
                 self.archive = m.group('archive')
                 self.proto = self._host and 'ssh' or 'file'
                 return True
