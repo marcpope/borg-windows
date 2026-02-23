@@ -44,7 +44,11 @@ cpu_threads = multiprocessing.cpu_count() if multiprocessing and multiprocessing
 on_rtd = os.environ.get("READTHEDOCS")
 
 # Extra cflags for all extensions, usually just warnings we want to enable explicitly
-cflags = ["-Wall", "-Wextra", "-Wpointer-arith", "-Wno-unreachable-code-fallthrough"]
+if is_win32:
+    # MSVC does not understand GCC/Clang warning flags
+    cflags = []
+else:
+    cflags = ["-Wall", "-Wextra", "-Wpointer-arith", "-Wno-unreachable-code-fallthrough"]
 
 compress_source = "src/borg/compress.pyx"
 crypto_ll_source = "src/borg/crypto/low_level.pyx"
@@ -129,7 +133,7 @@ if not on_rtd:
 
     crypto_extra_objects = []
     if is_win32:
-        crypto_ext_lib = lib_ext_kwargs(pc, "BORG_OPENSSL_PREFIX", "libcrypto", "libcrypto", ">=1.1.1", lib_subdir="")
+        crypto_ext_lib = lib_ext_kwargs(pc, "BORG_OPENSSL_PREFIX", "libcrypto", "libcrypto", ">=1.1.1", lib_subdir="lib\\VC\\x64\\MD")
     else:
         crypto_ext_lib = lib_ext_kwargs(pc, "BORG_OPENSSL_PREFIX", "crypto", "libcrypto", ">=1.1.1")
 
@@ -183,7 +187,8 @@ if not on_rtd:
     )
     freebsd_ext = Extension("borg.platform.freebsd", [platform_freebsd_source], extra_compile_args=cflags)
     darwin_ext = Extension("borg.platform.darwin", [platform_darwin_source], extra_compile_args=cflags)
-    windows_ext = Extension("borg.platform.windows", [platform_windows_source], extra_compile_args=cflags)
+    windows_ext = Extension("borg.platform.windows", [platform_windows_source],
+                             libraries=["advapi32"], extra_compile_args=cflags)
 
     if not is_win32:
         ext_modules.append(posix_ext)

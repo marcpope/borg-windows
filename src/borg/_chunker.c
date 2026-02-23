@@ -2,6 +2,11 @@
 #include <fcntl.h>
 #if !defined(_MSC_VER)
 #   include <unistd.h>
+#else
+#   include <io.h>
+#   include <BaseTsd.h>
+    /* MSVC does not define ssize_t */
+    typedef SSIZE_T ssize_t;
 #endif
 
 /* Cyclic polynomial / buzhash

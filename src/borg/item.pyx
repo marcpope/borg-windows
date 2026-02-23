@@ -164,6 +164,7 @@ class Item(PropDict):
     acl_default = PropDict._make_property('acl_default', bytes)
     acl_extended = PropDict._make_property('acl_extended', bytes)
     acl_nfs4 = PropDict._make_property('acl_nfs4', bytes)
+    acl_windows = PropDict._make_property('acl_windows', bytes)
 
     mode = PropDict._make_property('mode', int)
     uid = PropDict._make_property('uid', int)

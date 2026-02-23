@@ -25,6 +25,7 @@ if not is_win32:
 else:
     from .windows import process_alive, local_pid_alive
     from .windows import uid2user, user2uid, gid2group, group2gid, getosusername
+    from .windows import acl_get, acl_set
 
 if is_linux:  # pragma: linux only
     from .linux import API_VERSION as OS_API_VERSION

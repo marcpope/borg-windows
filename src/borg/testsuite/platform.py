@@ -42,6 +42,16 @@ def are_acls_working():
             elif is_freebsd:
                 acl_key = 'acl_access'
                 acl_value = b'user::rw-\ngroup::r--\nmask::rw-\nother::---\nuser:root:rw-\ngroup:wheel:rw-\n'
+            elif is_win32:
+                acl_key = 'acl_windows'
+                # We don't pre-set an ACL value for the probe; we just read whatever the file has.
+                read_acl = {}
+                acl_get(filepath, read_acl, os.stat(filepath))
+                acl = read_acl.get(acl_key, None)
+                # Any NTFS file should have a DACL, so the SDDL should contain "D:".
+                if acl is not None and b'D:' in acl:
+                    return True
+                return False
             else:
                 return False  # ACLs unsupported on this platform.
             write_acl = {acl_key: acl_value}
@@ -56,6 +66,8 @@ def are_acls_working():
                     check_for = b'user::rw-'
                 elif is_freebsd:
                     check_for = b'user::rw-'
+                elif is_win32:
+                    check_for = b'D:'  # should not reach here; handled above
                 else:
                     return False  # ACLs unsupported on this platform.
                 if check_for in acl:
@@ -219,6 +231,83 @@ class PlatformDarwinTestCase(BaseTestCase):
         self.set_acl(file2.name, b'!#acl 1\ngroup:ABCDEFAB-CDEF-ABCD-EFAB-CDEF00000000:staff:0:allow:read\nuser:FFFFEEEE-DDDD-CCCC-BBBB-AAAA00000000:root:0:allow:read\n', numeric_ids=True)
         self.assert_in(b'group:ABCDEFAB-CDEF-ABCD-EFAB-CDEF00000000:wheel:0:allow:read', self.get_acl(file2.name)['acl_extended'])
         self.assert_in(b'group:ABCDEFAB-CDEF-ABCD-EFAB-CDEF00000000::0:allow:read', self.get_acl(file2.name, numeric_ids=True)['acl_extended'])
+
+
+@unittest.skipUnless(is_win32, 'Windows only test')
+class PlatformWindowsTestCase(BaseTestCase):
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir)
+
+    def get_acl(self, path, numeric_ids=False):
+        item = {}
+        acl_get(path, item, os.stat(path), numeric_ids=numeric_ids)
+        return item
+
+    def set_acl(self, path, acl_sddl):
+        item = {'acl_windows': acl_sddl}
+        acl_set(path, item)
+
+    @unittest.skipIf(not are_acls_working(), 'ACLs do not work')
+    def test_read_dacl(self):
+        """Every NTFS file should have a DACL; verify we can read it as SDDL."""
+        file = tempfile.NamedTemporaryFile(dir=self.tmpdir, delete=False)
+        file.close()
+        acl = self.get_acl(file.name)
+        self.assert_in('acl_windows', acl)
+        sddl = acl['acl_windows']
+        # SDDL for a regular file should contain an owner (O:), group (G:), and DACL (D:) section.
+        self.assert_in(b'O:', sddl)
+        self.assert_in(b'D:', sddl)
+
+    @unittest.skipIf(not are_acls_working(), 'ACLs do not work')
+    def test_roundtrip_dacl(self):
+        """Write an ACL, read it back, verify the ACEs round-trip.
+
+        Note: Windows may add the AI (auto-inherited) flag to the DACL control
+        flags after a SetNamedSecurityInfo call, so we compare the individual
+        ACEs rather than the full SDDL string for exact equality.
+        """
+        import re
+        file = tempfile.NamedTemporaryFile(dir=self.tmpdir, delete=False)
+        file.close()
+        # Read the original SDDL.
+        original = self.get_acl(file.name)['acl_windows']
+        # Write it back to the same file.
+        self.set_acl(file.name, original)
+        # Read again.
+        restored = self.get_acl(file.name)['acl_windows']
+        # Extract owner SID — the O:SID portion before the next section (G:, D:, or S:).
+        orig_owner = re.search(rb'O:(S-[\d-]+|[A-Z]+)', original)
+        rest_owner = re.search(rb'O:(S-[\d-]+|[A-Z]+)', restored)
+        if orig_owner and rest_owner:
+            self.assert_equal(orig_owner.group(1), rest_owner.group(1))
+        # Extract individual ACEs — the (A;...) entries should all be preserved.
+        orig_aces = sorted(re.findall(rb'\([^)]+\)', original))
+        rest_aces = sorted(re.findall(rb'\([^)]+\)', restored))
+        self.assert_equal(orig_aces, rest_aces)
+
+    @unittest.skipIf(not are_acls_working(), 'ACLs do not work')
+    def test_directory_dacl(self):
+        """Verify we can read a DACL from a directory."""
+        acl = self.get_acl(self.tmpdir)
+        self.assert_in('acl_windows', acl)
+        sddl = acl['acl_windows']
+        self.assert_in(b'D:', sddl)
+
+    @unittest.skipIf(not are_acls_working(), 'ACLs do not work')
+    def test_no_acl_key_means_no_restore(self):
+        """acl_set with no acl_windows key should be a no-op."""
+        file = tempfile.NamedTemporaryFile(dir=self.tmpdir, delete=False)
+        file.close()
+        original = self.get_acl(file.name)['acl_windows']
+        # Call acl_set with an empty item — should not change anything.
+        acl_set(file.name, {})
+        restored = self.get_acl(file.name)['acl_windows']
+        self.assert_equal(original, restored)
 
 
 @unittest.skipUnless(sys.platform.startswith(('linux', 'freebsd', 'darwin')), 'POSIX only tests')
