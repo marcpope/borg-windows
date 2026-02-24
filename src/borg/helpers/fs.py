@@ -163,9 +163,12 @@ def make_path_safe(path):
     if is_win32:
         # Normalize backslashes to forward slashes so archives are portable across OSes.
         path = path.replace('\\', '/')
-        # Strip drive letter prefix (e.g. "C:" or "C:/")
+        # Convert drive letter to a path component (e.g. "C:/Users" -> "C/Users").
+        # This preserves the drive identity for multi-drive backups and matches
+        # how Mac/Linux store volume names as path components.
+        # Use --strip-components 1 on extract to remove the drive letter folder.
         if len(path) >= 2 and path[1] == ':':
-            path = path[2:]
+            path = path[0] + path[2:]
     return _safe_re.sub('', path) or '.'
 
 
