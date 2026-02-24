@@ -352,7 +352,7 @@ class FuseBackend:
         for item_inode, item in self.cache.iter_archive_items(archive.metadata.items, filter=filter,
                                                               consider_part_files=self._args.consider_part_files):
             if strip_components:
-                item.path = os.sep.join(item.path.split(os.sep)[strip_components:])
+                item.path = '/'.join(item.path.split('/')[strip_components:])
             path = os.fsencode(item.path)
             is_dir = stat.S_ISDIR(item.mode)
             if is_dir:
@@ -404,7 +404,7 @@ class FuseBackend:
             return name + version_enc + ext
 
         if 'source' in item and hardlinkable(item.mode):
-            source = os.sep.join(item.source.split(os.sep)[stripped_components:])
+            source = '/'.join(item.source.split('/')[stripped_components:])
             chunks, link_target = hardlink_masters.get(item.source, (None, source))
             if link_target:
                 # Hard link was extracted previously, just link

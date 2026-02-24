@@ -741,7 +741,7 @@ Utilization of max. archive size: {csize_max:.0%}
         hardlink_set = False
         # Hard link?
         if 'source' in item:
-            source = os.path.join(dest, *item.source.split(os.sep)[stripped_components:])
+            source = os.path.join(dest, *item.source.split('/')[stripped_components:])
             chunks, link_target = hardlink_masters.get(item.source, (None, source))
             if link_target and has_link:
                 # Hard link was extracted previously, just link

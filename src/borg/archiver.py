@@ -858,7 +858,7 @@ class Archiver:
     def build_filter(matcher, peek_and_store_hardlink_masters, strip_components):
         if strip_components:
             def item_filter(item):
-                matched = matcher.match(item.path) and os.sep.join(item.path.split(os.sep)[strip_components:])
+                matched = matcher.match(item.path) and '/'.join(item.path.split('/')[strip_components:])
                 peek_and_store_hardlink_masters(item, matched)
                 return matched
         else:
@@ -916,7 +916,7 @@ class Archiver:
                                        preload=True, hardlink_masters=hardlink_masters):
             orig_path = item.path
             if strip_components:
-                item.path = os.sep.join(orig_path.split(os.sep)[strip_components:])
+                item.path = '/'.join(orig_path.split('/')[strip_components:])
             if not args.dry_run:
                 while dirs and not item.path.startswith(dirs[-1].path):
                     dir_item = dirs.pop(-1)
@@ -1067,7 +1067,7 @@ class Archiver:
             if modebits == stat.S_IFREG:
                 tarinfo.type = tarfile.REGTYPE
                 if 'source' in item:
-                    source = os.sep.join(item.source.split(os.sep)[strip_components:])
+                    source = '/'.join(item.source.split('/')[strip_components:])
                     if hardlink_masters is None:
                         linkname = source
                     else:
@@ -1110,7 +1110,7 @@ class Archiver:
                                        preload=True, hardlink_masters=hardlink_masters):
             orig_path = item.path
             if strip_components:
-                item.path = os.sep.join(orig_path.split(os.sep)[strip_components:])
+                item.path = '/'.join(orig_path.split('/')[strip_components:])
             tarinfo, stream = item_to_tarinfo(item, orig_path)
             if tarinfo:
                 if output_list:
