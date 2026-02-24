@@ -160,6 +160,12 @@ _safe_re = re.compile(r'^((\.\.)?/+)+')
 def make_path_safe(path):
     """Make path safe by making it relative and local.
     """
+    if is_win32:
+        # Normalize backslashes to forward slashes so archives are portable across OSes.
+        path = path.replace('\\', '/')
+        # Strip drive letter prefix (e.g. "C:" or "C:/")
+        if len(path) >= 2 and path[1] == ':':
+            path = path[2:]
     return _safe_re.sub('', path) or '.'
 
 
