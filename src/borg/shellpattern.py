@@ -2,13 +2,13 @@ import os
 import re
 
 
-def translate(pat, match_end=r"\Z"):
+def translate(pat, match_end=r"\Z", sep=None):
     """Translate a shell-style pattern to a regular expression.
 
-    The pattern may include ``**<sep>`` (<sep> stands for the platform-specific path separator; "/" on POSIX systems) for
-    matching zero or more directory levels and "*" for matching zero or more arbitrary characters with the exception of
-    any path separator. Wrap meta-characters in brackets for a literal match (i.e. "[?]" to match the literal character
-    "?").
+    The pattern may include ``**<sep>`` (<sep> stands for the path separator; "/" by default since archive paths
+    always use forward slashes) for matching zero or more directory levels and "*" for matching zero or more
+    arbitrary characters with the exception of any path separator. Wrap meta-characters in brackets for a literal
+    match (i.e. "[?]" to match the literal character "?").
 
     Using match_end=regex, one can provide a regular expression that is used to match after the regex that is generated from
     the pattern. The default is to match the end of the string.
@@ -20,7 +20,8 @@ def translate(pat, match_end=r"\Z"):
     TODO: support {alt1,alt2} shell-style alternatives.
 
     """
-    sep = os.path.sep
+    if sep is None:
+        sep = os.path.sep
     n = len(pat)
     i = 0
     res = ""

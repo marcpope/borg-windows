@@ -150,7 +150,7 @@ class PatternMatcher:
         in self.fallback is returned (defaults to None).
 
         """
-        path = normalize_path(path).lstrip(os.path.sep)
+        path = normalize_path(path).replace('\\', '/').lstrip('/')
         # Do a fast lookup for full path matches (note: we do not count such matches):
         non_existent = object()
         value = self._path_full_patterns.get(path, non_existent)
@@ -222,7 +222,9 @@ class PathFullPattern(PatternBase):
     PREFIX = "pf"
 
     def _prepare(self, pattern):
-        self.pattern = os.path.normpath(pattern).lstrip(os.path.sep)  # sep at beginning is removed
+        # Use '/' as separator since archive paths always use forward slashes.
+        pattern = pattern.replace('\\', '/')
+        self.pattern = os.path.normpath(pattern).replace('\\', '/').lstrip('/')  # sep at beginning is removed
 
     def _match(self, path):
         return path == self.pattern
@@ -242,12 +244,12 @@ class PathPrefixPattern(PatternBase):
     PREFIX = "pp"
 
     def _prepare(self, pattern):
-        sep = os.path.sep
-
-        self.pattern = (os.path.normpath(pattern).rstrip(sep) + sep).lstrip(sep)  # sep at beginning is removed
+        # Use '/' as separator since archive paths always use forward slashes.
+        pattern = pattern.replace('\\', '/')
+        self.pattern = (os.path.normpath(pattern).replace('\\', '/').rstrip('/') + '/').lstrip('/')  # sep at beginning is removed
 
     def _match(self, path):
-        return (path + os.path.sep).startswith(self.pattern)
+        return (path + '/').startswith(self.pattern)
 
 
 class FnmatchPattern(PatternBase):
@@ -257,19 +259,21 @@ class FnmatchPattern(PatternBase):
     PREFIX = "fm"
 
     def _prepare(self, pattern):
-        if pattern.endswith(os.path.sep):
-            pattern = os.path.normpath(pattern).rstrip(os.path.sep) + os.path.sep + '*' + os.path.sep
+        # Use '/' as separator since archive paths always use forward slashes.
+        pattern = pattern.replace('\\', '/')
+        if pattern.endswith('/'):
+            pattern = os.path.normpath(pattern).replace('\\', '/').rstrip('/') + '/' + '*' + '/'
         else:
-            pattern = os.path.normpath(pattern) + os.path.sep + '*'
+            pattern = os.path.normpath(pattern).replace('\\', '/') + '/' + '*'
 
-        self.pattern = pattern.lstrip(os.path.sep)  # sep at beginning is removed
+        self.pattern = pattern.lstrip('/')  # sep at beginning is removed
 
         # fnmatch and re.match both cache compiled regular expressions.
         # Nevertheless, this is about 10 times faster.
         self.regex = re.compile(fnmatch.translate(self.pattern))
 
     def _match(self, path):
-        return (self.regex.match(path + os.path.sep) is not None)
+        return (self.regex.match(path + '/') is not None)
 
 
 class ShellPattern(PatternBase):
@@ -279,18 +283,19 @@ class ShellPattern(PatternBase):
     PREFIX = "sh"
 
     def _prepare(self, pattern):
-        sep = os.path.sep
+        # Use '/' as separator since archive paths always use forward slashes.
+        pattern = pattern.replace('\\', '/')
 
-        if pattern.endswith(sep):
-            pattern = os.path.normpath(pattern).rstrip(sep) + sep + "**" + sep + "*" + sep
+        if pattern.endswith('/'):
+            pattern = os.path.normpath(pattern).replace('\\', '/').rstrip('/') + '/' + "**" + '/' + "*" + '/'
         else:
-            pattern = os.path.normpath(pattern) + sep + "**" + sep + "*"
+            pattern = os.path.normpath(pattern).replace('\\', '/') + '/' + "**" + '/' + "*"
 
-        self.pattern = pattern.lstrip(sep)  # sep at beginning is removed
-        self.regex = re.compile(shellpattern.translate(self.pattern))
+        self.pattern = pattern.lstrip('/')  # sep at beginning is removed
+        self.regex = re.compile(shellpattern.translate(self.pattern, sep='/'))
 
     def _match(self, path):
-        return (self.regex.match(path + os.path.sep) is not None)
+        return (self.regex.match(path + '/') is not None)
 
 
 class RegexPattern(PatternBase):
