@@ -4,7 +4,7 @@ This is a fork of [BorgBackup](https://github.com/borgbackup/borg) 1.4.x with na
 
 #### Restoring files to their original location
 
-Windows drive letters are stored as the first path component in archives (e.g. `C:\Users\marcp\file.txt` becomes `C/Users/marcp/file.txt`). To restore files back to their original location, use `--strip-components 1` to remove the drive letter folder:
+Windows drive letters are stored as the first path component in archives (e.g. `C:\Users\johnsmith\file.txt` becomes `C/Users/johnsmith/file.txt`). To restore files back to their original location, use `--strip-components 1` to remove the drive letter folder:
 
 ```powershell
 cd C:\
