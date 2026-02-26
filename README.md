@@ -11,7 +11,7 @@ cd C:\
 borg.exe extract /path/to/repo::archive --strip-components 1
 ```
 
-For multi-drive backups, extract each drive separately:
+For multi-drive restores, extract each drive separately:
 ```powershell
 cd C:\
 borg.exe extract /path/to/repo::archive C --strip-components 1
