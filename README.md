@@ -1,6 +1,6 @@
 # Borg Backup - Native Windows Build
 
-This is a fork of [BorgBackup](https://github.com/borgbackup/borg) 1.4.x with native Windows support.
+This is a fork of [BorgBackup](https://github.com/borgbackup/borg) 1.4.3 with native Windows support.
 
 You can get the latest release here: [Releases](https://github.com/marcpope/borg-windows/releases)
 
