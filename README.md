@@ -2,6 +2,24 @@
 
 This is a fork of [BorgBackup](https://github.com/borgbackup/borg) 1.4.x with native Windows support.
 
+#### Restoring files to their original location
+
+Windows drive letters are stored as the first path component in archives (e.g. `C:\Users\marcp\file.txt` becomes `C/Users/marcp/file.txt`). To restore files back to their original location, use `--strip-components 1` to remove the drive letter folder:
+
+```powershell
+cd C:\
+borg.exe extract /path/to/repo::archive --strip-components 1
+```
+
+For multi-drive backups, extract each drive separately:
+```powershell
+cd C:\
+borg.exe extract /path/to/repo::archive C --strip-components 1
+cd D:\
+borg.exe extract /path/to/repo::archive D --strip-components 1
+```
+
+
 ## What was done
 
 This fork adds the ability to compile and run Borg natively on Windows (not through WSL or Cygwin). The key changes are:
