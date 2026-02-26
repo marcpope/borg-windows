@@ -2,7 +2,7 @@
 
 This is a fork of [BorgBackup](https://github.com/borgbackup/borg) 1.4.x with native Windows support.
 
-Most all commands work the same as borgbackup on linux works with the exception of the below:
+Most all commands work the same as BorgBackup on linux works with the exception of the below:
 
 #### Restoring files to their original location
 
