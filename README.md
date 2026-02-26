@@ -2,9 +2,11 @@
 
 This is a fork of [BorgBackup](https://github.com/borgbackup/borg) 1.4.x with native Windows support.
 
+Most all commands work the same as borgbackup on linux works with the exception of the below:
+
 #### Restoring files to their original location
 
-Windows drive letters are stored as the first path component in archives (e.g. `C:\Users\johnsmith\file.txt` becomes `C/Users/johnsmith/file.txt`). To restore files back to their original location, use `--strip-components 1` to remove the drive letter folder:
+Windows does not have the same root structure for Volumes as Linux & Mac. So Windows drive letters are stored as the first path component in archives (e.g. `C:\Users\johnsmith\file.txt` becomes `C/Users/johnsmith/file.txt`). To restore files back to their original location, use `--strip-components 1` to remove the drive letter folder:
 
 ```powershell
 cd C:\
