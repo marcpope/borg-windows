@@ -14,6 +14,7 @@ import threading
 import time
 import traceback
 from queue import Queue, Empty
+import subprocess
 from subprocess import Popen, PIPE
 
 from .platformflags import is_win32
@@ -1123,11 +1124,61 @@ This problem will go away as soon as the server has been upgraded to 1.0.7+.
 
     def close(self):
         if self.p:
-            self.p.stdin.close()
-            self.p.stdout.close()
-            self.p.stderr.close()
-            self.p.wait()
-            self.p = None
+            # Ordering matters, especially on Windows. We want the *server* (borg serve,
+            # reached via ssh) to reach its EOF-handling path so it can release the
+            # repository lock before we tear ssh down. That path is triggered when the
+            # server's stdin read returns 0 bytes, which only happens if our write end
+            # of the pipe is closed cleanly.
+            #
+            # Previously we closed all three pipes (stdin, stdout, stderr) up-front and
+            # then called p.wait() with no timeout. On POSIX this works because the
+            # select()-based server loop drains any in-flight response first. On Windows
+            # the daemon reader threads are still blocked on pipe.read() when we close
+            # our stdout read-end, which on some pipe states causes ssh to deliver an
+            # abortive FIN/RST on the forward channel to the remote sshd before the EOF
+            # on stdin has been flushed. The server process then dies from a broken pipe
+            # *before* it gets to repository.close(), leaving the server-side lock.exclusive
+            # file behind. The next backup then fails with a lock-acquisition timeout.
+            # See the field report linked from borg-windows v1.4.4-win6.
+            try:
+                # (1) Tell the server "no more requests" by closing stdin. This is the
+                #     only signal the server's serve() loop uses to trigger lock release.
+                try:
+                    self.p.stdin.close()
+                except OSError:
+                    pass
+                # (2) Wait a bounded time for ssh.exe to exit on its own. On the happy
+                #     path the server sees EOF, releases the lock, and ssh exits within
+                #     milliseconds. We give it generous headroom to cover server-side
+                #     commit work that may still be draining.
+                try:
+                    self.p.wait(timeout=30)
+                except subprocess.TimeoutExpired:
+                    logger.warning('RemoteRepository: ssh child did not exit within 30s after '
+                                   'closing stdin; terminating it. The server-side lock may be stale.')
+                    try:
+                        self.p.kill()
+                    except OSError:
+                        pass
+                    try:
+                        self.p.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        pass
+                # (3) Join the Windows reader threads so we don't leak their handles or
+                #     race with them touching self.p.stdout/self.p.stderr. On POSIX these
+                #     attributes don't exist.
+                for attr in ('_stdout_reader', '_stderr_reader'):
+                    reader = getattr(self, attr, None)
+                    if reader is not None:
+                        reader.join(timeout=5)
+                # (4) Only now is it safe to close our read ends of stdout/stderr.
+                for pipe in (self.p.stdout, self.p.stderr):
+                    try:
+                        pipe.close()
+                    except OSError:
+                        pass
+            finally:
+                self.p = None
 
     def async_response(self, wait=True):
         for resp in self.call_many('async_responses', calls=[], wait=True, async_wait=wait):
