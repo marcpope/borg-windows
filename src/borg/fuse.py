@@ -1,3 +1,18 @@
+"""
+FUSE filesystem implementation for `borg mount`.
+
+IMPORTANT
+=========
+
+This code is only safe for single-threaded and synchronous (non-async) usage.
+
+- llfuse is synchronous and used with workers=1, so there is only 1 thread,
+  and we are safe.
+- pyfuse3 uses Trio, which only uses 1 thread, but could use this code in an
+  asynchronous manner. However, as long as we do not use any asynchronous
+  operations (like using "await") in this code, it is still de facto
+  synchronous, and we are safe.
+"""
 import errno
 import functools
 import io
@@ -162,7 +177,7 @@ class ItemCache:
         for key, (csize, data) in zip(archive_item_ids, self.decrypted_repository.get_many(archive_item_ids)):
             # Store the chunk ID in the meta-array
             if write_offset + 32 >= len(meta):
-                self.meta = meta = meta + bytes(self.GROW_META_BY)
+                meta.extend(bytes(self.GROW_META_BY))
             meta[write_offset:write_offset + 32] = key
             current_id_offset = write_offset
             write_offset += 32
@@ -200,7 +215,7 @@ class ItemCache:
                 msgpacked_bytes = b''
 
                 if write_offset + 9 >= len(meta):
-                    self.meta = meta = meta + bytes(self.GROW_META_BY)
+                    meta.extend(bytes(self.GROW_META_BY))
 
                 # item entries in the meta-array come in two different flavours, both nine bytes long.
                 # (1) for items that span chunks:
@@ -552,6 +567,7 @@ class FuseOperations(llfuse.Operations, FuseBackend):
                                 user=dir_user, group=dir_group, uid=dir_uid, gid=dir_gid)
         self._create_filesystem()
         llfuse.init(self, mountpoint, options)
+        logger.warning('Warning: The mounted archive is capable of containing symlinks that point outside the archive tree. When following such symlinks you may see files and directories within the mountpoint that do not reflect the archive content.')
         if not foreground:
             if isinstance(self.repository_uncached, RemoteRepository):
                 daemonize()

@@ -1567,6 +1567,7 @@ class Archiver:
                 Time (end): {end}
                 Duration: {duration}
                 Number of files: {stats[nfiles]}
+                Working Directory: {cwd}
                 Command line: {command_line}
                 Utilization of maximum supported archive size: {limits[max_archive_size]:.0%}
                 ------------------------------------------------------------------------------
@@ -1658,6 +1659,12 @@ class Archiver:
                 keep += prune_split(archives, rule, num, kept_because)
 
         to_delete = (set(archives) | checkpoints) - (set(keep) | set(keep_checkpoints))
+        pruned_checkpoints_len = len(set(checkpoints) - set(keep_checkpoints))
+        pruned_archives_len = len(to_delete) - pruned_checkpoints_len
+        logger.info('Found %d normal archives and %d checkpoint archives.',
+                    len(archives), len(checkpoints))
+        logger.info('Keeping %d archives and %d checkpoints, pruning %d archives and %d checkpoints.',
+                    len(keep), len(keep_checkpoints), pruned_archives_len, pruned_checkpoints_len)
         stats = Statistics(iec=args.iec)
         with Cache(repository, key, manifest, lock_wait=self.lock_wait, iec=args.iec) as cache:
             def checkpoint_func():
@@ -2406,8 +2413,8 @@ class Archiver:
     def do_debug_convert_profile(self, args):
         """convert Borg profile to Python profile"""
         import marshal
-        with args.output, args.input:
-            marshal.dump(msgpack.unpack(args.input, use_list=False, raw=False), args.output)
+        with open(args.input, 'rb') as input_file, open(args.output, 'wb') as output_file:
+            marshal.dump(msgpack.unpack(input_file, use_list=False, raw=False), output_file)
 
     @with_repository(lock=False, manifest=False)
     def do_break_lock(self, args, repository):
@@ -3226,6 +3233,11 @@ class Archiver:
         When mounting a repository, the top directories will be named like the
         archives and the directory structure below these will be loaded on-demand from
         the repository when entering these directories, so expect some delay.
+
+        Care should be taken, as Borg backs up symlinks as-is. When an archive
+        or repository is mounted, it is possible to “jump” outside the mount point
+        by following a symlink. If this happens, files or directories (or versions of them)
+        that are not part of the archive or repository may appear to be within the mount point.
 
         Unless the ``--foreground`` option is given the command will run in the
         background until the filesystem is ``unmounted``.
@@ -4135,10 +4147,8 @@ class Archiver:
                                           formatter_class=argparse.RawDescriptionHelpFormatter,
                                           help='convert Borg profile to Python profile (debug)')
         subparser.set_defaults(func=self.do_debug_convert_profile)
-        subparser.add_argument('input', metavar='INPUT', type=argparse.FileType('rb'),
-                               help='Borg profile')
-        subparser.add_argument('output', metavar='OUTPUT', type=argparse.FileType('wb'),
-                               help='Output file')
+        subparser.add_argument('input', metavar='INPUT', type=str, help='Borg profile')
+        subparser.add_argument('output', metavar='OUTPUT', type=str, help='Output file')
 
         # borg delete
         delete_epilog = process_epilog("""
@@ -4761,27 +4771,33 @@ class Archiver:
         subparser.set_defaults(fallback_func=functools.partial(self.do_subcommand_help, subparser))
 
         key_export_epilog = process_epilog("""
+        This command backs up the borg key.
+
         If repository encryption is used, the repository is inaccessible
-        without the key. This command allows one to back up this essential key.
+        without the borg key (and the passphrase that protects the borg key).
+        If a repository is not encrypted, but authenticated, the borg key is
+        still needed to access the repository normally.
+
+        For repositories using **keyfile** encryption the key is kept locally
+        on the system that is capable of doing backups. To guard against loss
+        or corruption of this key, the key needs to be backed up independently
+        of the main data backup.
+
+        For repositories using **repokey** encryption or **authenticated** mode
+        the key is kept in the repository. A backup is thus not strictly needed,
+        but guards against the repository becoming inaccessible if the key is
+        corrupted or lost.
+
         Note that the backup produced does not include the passphrase itself
-        (i.e., the exported key stays encrypted). In order to regain access to a
+        (i.e. the exported key stays encrypted). In order to regain access to a
         repository, one needs both the exported key and the original passphrase.
+        Keep the exported key and the passphrase at safe places.
 
         There are three backup formats. The normal backup format is suitable for
         digital storage as a file. The ``--paper`` backup format is optimized
-        for printing and typing in while importing, with per-line checks to
-        reduce problems with manual input. The ``--qr-html`` option creates a printable
+        for printing and typing in while importing, with per line checks to
+        reduce problems with manual input. The ``--qr-html`` creates a printable
         HTML template with a QR code and a copy of the ``--paper``-formatted key.
-
-        For repositories using keyfile encryption the key is saved locally
-        on the system that is capable of doing backups. To guard against loss
-        of this key, the key needs to be backed up independently of the main
-        data backup.
-
-        For repositories using repokey encryption, the key is saved in the
-        repository in the config file. A backup is thus not strictly needed,
-        but it guards against the repository becoming inaccessible if the file
-        is damaged for some reason.
 
         Examples::
 
@@ -5235,8 +5251,8 @@ class Archiver:
         subparser.add_argument('--append-only', dest='append_only', action='store_true',
                                help='only allow appending to repository segment files. Note that this only '
                                     'affects the low level structure of the repository, and running `delete` '
-                                    'or `prune` will still be allowed. See :ref:`append_only_mode` in Additional '
-                                    'Notes for more details.')
+                                    'or `prune` or reading from the repository will still be allowed. '
+                                    'See :ref:`append_only_mode` in Additional Notes for more details.')
         subparser.add_argument('--storage-quota', metavar='QUOTA', dest='storage_quota',
                                type=parse_storage_quota, default=None,
                                help='Override storage quota of the repository (e.g. 5G, 1.5T). '

@@ -4,7 +4,7 @@ import locale
 import os
 
 cimport cython
-from libc.stdint cimport uint32_t, UINT32_MAX, uint64_t
+from libc.stdint cimport int64_t, uint32_t, UINT32_MAX, uint64_t
 from libc.errno cimport errno
 from libc.string cimport memcpy
 from cpython.exc cimport PyErr_SetFromErrnoWithFilename
@@ -22,11 +22,12 @@ cdef extern from "_hashindex.c":
         uint32_t version
         char hash[16]
 
-    HashIndex *hashindex_read(object file_py, int permit_compact) except *
+    HashIndex *hashindex_read(object file_py, int permit_compact,
+                              int expected_key_size, int expected_value_size) except *
     HashIndex *hashindex_init(int capacity, int key_size, int value_size)
     void hashindex_free(HashIndex *index)
     int hashindex_len(HashIndex *index)
-    int hashindex_size(HashIndex *index)
+    int64_t hashindex_size(HashIndex *index)
     void hashindex_write(HashIndex *index, object file_py) except *
     unsigned char *hashindex_get(HashIndex *index, unsigned char *key)
     unsigned char *hashindex_next_key(HashIndex *index, unsigned char *key)
@@ -94,9 +95,9 @@ cdef class IndexBase:
         if path:
             if isinstance(path, (str, bytes)):
                 with open(path, 'rb') as fd:
-                    self.index = hashindex_read(fd, permit_compact)
+                    self.index = hashindex_read(fd, permit_compact, self.key_size, self.value_size)
             else:
-                self.index = hashindex_read(path, permit_compact)
+                self.index = hashindex_read(path, permit_compact, self.key_size, self.value_size)
             assert self.index, 'hashindex_read() returned NULL with no exception set'
         else:
             if usable is not None:
@@ -205,7 +206,7 @@ cdef class NSIndex(IndexBase):
     def __getitem__(self, key):
         assert len(key) == self.key_size
         data = <uint32_t *>hashindex_get(self.index, <unsigned char *>key)
-        if not data:
+        if data == NULL:
             raise KeyError(key)
         cdef uint32_t segment = _le32toh(data[0])
         assert segment <= _MAX_VALUE, "maximum number of segments reached"
@@ -237,8 +238,8 @@ cdef class NSIndex(IndexBase):
         iter.index = self.index
         if marker:
             key = hashindex_get(self.index, <unsigned char *>marker)
-            if marker is None:
-                raise IndexError
+            if key == NULL:
+                raise KeyError("marker not found")
             iter.key = key - self.key_size
         return iter
 
@@ -296,7 +297,7 @@ cdef class ChunkIndex(IndexBase):
     def __getitem__(self, key):
         assert len(key) == self.key_size
         data = <uint32_t *>hashindex_get(self.index, <unsigned char *>key)
-        if not data:
+        if data == NULL:
             raise KeyError(key)
         cdef uint32_t refcount = _le32toh(data[0])
         assert refcount <= _MAX_VALUE, "invalid reference count"
@@ -324,7 +325,7 @@ cdef class ChunkIndex(IndexBase):
         """Increase refcount for 'key', return (refcount, size, csize)."""
         assert len(key) == self.key_size
         data = <uint32_t *>hashindex_get(self.index, <unsigned char *>key)
-        if not data:
+        if data == NULL:
             raise KeyError(key)
         cdef uint32_t refcount = _le32toh(data[0])
         assert refcount <= _MAX_VALUE, "invalid reference count"
@@ -337,7 +338,7 @@ cdef class ChunkIndex(IndexBase):
         """Decrease refcount for 'key', return (refcount, size, csize)."""
         assert len(key) == self.key_size
         data = <uint32_t *>hashindex_get(self.index, <unsigned char *>key)
-        if not data:
+        if data == NULL:
             raise KeyError(key)
         cdef uint32_t refcount = _le32toh(data[0])
         # Never decrease a reference count of zero
@@ -354,8 +355,8 @@ cdef class ChunkIndex(IndexBase):
         iter.index = self.index
         if marker:
             key = hashindex_get(self.index, <unsigned char *>marker)
-            if marker is None:
-                raise IndexError
+            if key == NULL:
+                raise KeyError("marker not found")
             iter.key = key - self.key_size
         return iter
 
@@ -406,7 +407,7 @@ cdef class ChunkIndex(IndexBase):
                 break
             our_values = <const uint32_t*> (key + self.key_size)
             master_values = <const uint32_t*> hashindex_get(master, key)
-            if not master_values:
+            if master_values == NULL:
                 raise ValueError('stats_against: key contained in self but not in master_index.')
             our_refcount = _le32toh(our_values[0])
             chunk_size = _le32toh(master_values[1])
@@ -434,7 +435,7 @@ cdef class ChunkIndex(IndexBase):
     cdef _add(self, unsigned char *key, uint32_t *data):
         cdef uint64_t refcount1, refcount2, result64
         values = <uint32_t*> hashindex_get(self.index, key)
-        if values:
+        if values != NULL:
             refcount1 = _le32toh(values[0])
             refcount2 = _le32toh(data[0])
             assert refcount1 <= _MAX_VALUE, "invalid reference count"

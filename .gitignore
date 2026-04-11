@@ -33,3 +33,4 @@ borg.exe
 .vagrant
 .eggs
 CLAUDE.md
+.DS_Store

@@ -555,6 +555,7 @@ class Archive:
             cp = normalize_chunker_params(cp) if cp is not None else ''
             info.update({
                 'command_line': self.metadata.cmdline,
+                'cwd': self.metadata.get('cwd', ''),
                 'hostname': self.metadata.hostname,
                 'username': self.metadata.username,
                 'comment': self.metadata.get('comment', ''),
@@ -635,6 +636,7 @@ Utilization of max. archive size: {csize_max:.0%}
             'username': getuser(),
             'time': start.strftime(ISO_FORMAT),
             'time_end': end.strftime(ISO_FORMAT),
+            'cwd': self.cwd,
             'chunker_params': self.chunker_params,
         }
         # we always want to create archives with the addtl. metadata (nfiles, etc.),
@@ -832,6 +834,7 @@ Utilization of max. archive size: {csize_max:.0%}
                 with backup_io('open'):
                     fd = open(path, 'wb')
                 with fd:
+                    trailing_hole = False
                     ids = [c.id for c in item.chunks]
                     for data in self.pipeline.fetch_many(ids, is_preloaded=True):
                         if pi:
@@ -840,10 +843,18 @@ Utilization of max. archive size: {csize_max:.0%}
                             if sparse and zeros.startswith(data):
                                 # all-zero chunk: create a hole in a sparse file
                                 fd.seek(len(data), 1)
+                                trailing_hole = True
                             else:
                                 fd.write(data)
+                                trailing_hole = False
                     with backup_io('truncate_and_attrs'):
                         pos = item_chunks_size = fd.tell()
+                        if is_win32 and trailing_hole and pos > 0:
+                            # Windows: truncate() does not zero-fill properly (no VDL update).
+                            # Writing a single zero at the end forces NTFS to zero-fill the hole
+                            # and update valid data length.
+                            fd.seek(pos - 1)
+                            fd.write(b"\0")
                         fd.truncate(pos)
                         fd.flush()
                         self.restore_attrs(path, item, fd=fd.fileno())
@@ -1797,7 +1808,7 @@ class ArchiveChecker:
                 # if we kill the defect chunk here, subsequent actions within this "borg check"
                 # run will find missing chunks and replace them with all-zero replacement
                 # chunks and flag the files as "repaired".
-                # if another backup is done later and the missing chunks get backupped again,
+                # if another backup is done later and the missing chunks get backed up again,
                 # a "borg check" afterwards can heal all files where this chunk was missing.
                 logger.warning('Found defect chunks. They will be deleted now, so affected files can '
                                'get repaired now and maybe healed later.')

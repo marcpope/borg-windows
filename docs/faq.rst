@@ -544,11 +544,10 @@ The Borg config directory has content that you should take care of:
   recovered.
 
 ``keys`` subdirectory
-  All your borg keyfile keys are stored in this directory. Please note that
-  borg repokey keys are stored inside the repository. You MUST make sure to have an
-  independent backup of these keyfiles, otherwise you cannot access your backups anymore if you lose
-  them. You also MUST keep these files secret; everyone who gains access to your repository and has
-  the corresponding keyfile (and the key passphrase) can extract it.
+  All your borg keyfile keys are stored in this directory. Please note that borg
+  repokey keys are stored inside the repository. In any case, you MUST make sure
+  to have an independent backup of the borg keys, see :ref:`borg_key_export` for
+  more details.
 
 Make sure that only you have access to the Borg config directory.
 
@@ -741,7 +740,7 @@ These are your options to protect against that:
 How can I protect against theft, sabotage, lightning, fire, ...?
 ----------------------------------------------------------------
 
-In general: if your only backup medium is nearby the backupped machine and
+In general: if your only backup medium is nearby the backed-up machine and
 always connected, you can easily get into trouble: they likely share the same
 fate if something goes really wrong.
 
@@ -794,7 +793,7 @@ Common issues
 There can be many causes of this error. E.g. you have incorrectly specified the repository path.
 
 You will also get this error if you try to access a repository that uses the argon2 key algorithm using an old version of borg.
-We recommend upgrading to the latest stable version and trying again. We are sorry. We should have thought abount forward
+We recommend upgrading to the latest stable version and trying again. We are sorry. We should have thought about forward
 compatibility and implemented a more helpful error message.
 
 Why am I seeing idle borg serve processes on the repo server?
@@ -1413,7 +1412,7 @@ There are some caveats:
 Why is my backup bigger than with attic?
 ----------------------------------------
 
-Attic was rather unflexible when it comes to compression, it always
+Attic was rather inflexible when it comes to compression, it always
 compressed using zlib level 6 (no way to switch compression off or
 adjust the level or algorithm).
 

@@ -133,13 +133,13 @@ jobs:
           }' || '{
             "include": [
               {"os": "ubuntu-22.04", "python-version": "3.10", "toxenv": "py310-fuse2"},
-              {"os": "ubuntu-22.04", "python-version": "3.11", "toxenv": "py311-fuse2", "binary": "borg-linux-glibc235-x86_64-gh"},
-              {"os": "ubuntu-22.04-arm", "python-version": "3.11", "toxenv": "py311-fuse2", "binary": "borg-linux-glibc235-arm64-gh"},
+              {"os": "ubuntu-22.04", "python-version": "3.11", "toxenv": "py311-fuse3", "binary": "borg-linux-glibc235-x86_64-gh"},
+              {"os": "ubuntu-22.04-arm", "python-version": "3.11", "toxenv": "py311-fuse3", "binary": "borg-linux-glibc235-arm64-gh"},
               {"os": "ubuntu-24.04", "python-version": "3.12", "toxenv": "py312-fuse3"},
               {"os": "ubuntu-24.04", "python-version": "3.13", "toxenv": "py313-fuse3"},
               {"os": "ubuntu-24.04", "python-version": "3.14", "toxenv": "py314-fuse3"},
-              {"os": "macos-13", "python-version": "3.11", "toxenv": "py311-none", "binary": "borg-macos-13-x86_64-gh"},
-              {"os": "macos-14", "python-version": "3.11", "toxenv": "py311-none", "binary": "borg-macos-14-arm64-gh"}
+              {"os": "macos-15-intel", "python-version": "3.11", "toxenv": "py311-none", "binary": "borg-macos-15-x86_64-gh"},
+              {"os": "macos-15", "python-version": "3.11", "toxenv": "py311-none", "binary": "borg-macos-15-arm64-gh"}
             ]
           }'
         ) }}
@@ -148,7 +148,8 @@ jobs:
       TOXENV: ${{ matrix.toxenv }}
 
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 180
+    # macOS machines can be slow, if overloaded.
+    timeout-minutes: 360
 
     steps:
     - uses: actions/checkout@v4
@@ -450,7 +451,7 @@ jobs:
       if: startsWith(github.ref, 'refs/tags/') && matrix.do_binaries
       uses: actions/upload-artifact@v4
       with:
-        name: ${{ matrix.os }}-${{ matrix.version }}-dist
+        name: ${{ matrix.artifact_prefix }}
         path: artifacts/*
         if-no-files-found: ignore
 
