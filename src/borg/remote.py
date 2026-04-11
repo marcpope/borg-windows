@@ -792,14 +792,9 @@ This problem will go away as soon as the server has been upgraded to 1.0.7+.
         def send_buffer():
             if self.to_send:
                 try:
-                    chunk = self.to_send.peek_front()
-                    pre_len = len(chunk)
-                    written = self.ratelimit.write(self.stdin_fd, chunk)
+                    written = self.ratelimit.write(self.stdin_fd, self.to_send.peek_front())
                     self.tx_bytes += written
                     self.to_send.pop_front(written)
-                    if is_win32:
-                        logger.debug('send_buffer: wrote %d/%d bytes (total tx=%d, remaining=%d)',
-                                     written, pre_len, self.tx_bytes, len(self.to_send))
                 except OSError as e:
                     # io.write might raise EAGAIN even though select indicates
                     # that the fd should be writable.
