@@ -6,6 +6,7 @@ from ..helpers import safe_encode
 
 
 from libc.stddef cimport wchar_t
+from libc.string cimport memset
 
 cdef extern from "Python.h":
     object PyUnicode_FromWideChar(const wchar_t *w, Py_ssize_t size)
@@ -49,24 +50,15 @@ cdef extern from 'windows.h':
         ULONGLONG WriteTransferCount
         ULONGLONG OtherTransferCount
 
+    # JOBOBJECT_BASIC_LIMIT_INFORMATION contains LARGE_INTEGER and ULONG_PTR fields
+    # which are unions/typedefs that Cython can't portably initialize. We don't set
+    # any of those fields directly — memset() zeros the whole struct and we only
+    # touch LimitFlags after — so we declare the struct opaquely to Cython.
     ctypedef struct JOBOBJECT_BASIC_LIMIT_INFORMATION:
-        long long PerProcessUserTimeLimit
-        long long PerJobUserTimeLimit
         DWORD LimitFlags
-        size_t MinimumWorkingSetSize
-        size_t MaximumWorkingSetSize
-        DWORD ActiveProcessLimit
-        size_t Affinity
-        DWORD PriorityClass
-        DWORD SchedulingClass
 
     ctypedef struct JOBOBJECT_EXTENDED_LIMIT_INFORMATION:
         JOBOBJECT_BASIC_LIMIT_INFORMATION BasicLimitInformation
-        IO_COUNTERS IoInfo
-        size_t ProcessMemoryLimit
-        size_t JobMemoryLimit
-        size_t PeakProcessMemoryUsed
-        size_t PeakJobMemoryUsed
 
 
 # Security descriptor / ACL types
@@ -207,26 +199,11 @@ cdef HANDLE _ensure_kill_on_exit_job() except? NULL:
     if job == NULL:
         raise OSError(None, 'CreateJobObjectW failed', None, GetLastError())
 
-    # Zero-initialize the struct, then set only the kill-on-close limit flag.
-    info.BasicLimitInformation.PerProcessUserTimeLimit = 0
-    info.BasicLimitInformation.PerJobUserTimeLimit = 0
+    # Zero the whole struct (including the LARGE_INTEGER/ULONG_PTR fields we don't
+    # declare), then set only the kill-on-close limit flag. sizeof() here picks up
+    # the real C struct size from windows.h, not Cython's opaque view.
+    memset(&info, 0, sizeof(JOBOBJECT_EXTENDED_LIMIT_INFORMATION))
     info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
-    info.BasicLimitInformation.MinimumWorkingSetSize = 0
-    info.BasicLimitInformation.MaximumWorkingSetSize = 0
-    info.BasicLimitInformation.ActiveProcessLimit = 0
-    info.BasicLimitInformation.Affinity = 0
-    info.BasicLimitInformation.PriorityClass = 0
-    info.BasicLimitInformation.SchedulingClass = 0
-    info.IoInfo.ReadOperationCount = 0
-    info.IoInfo.WriteOperationCount = 0
-    info.IoInfo.OtherOperationCount = 0
-    info.IoInfo.ReadTransferCount = 0
-    info.IoInfo.WriteTransferCount = 0
-    info.IoInfo.OtherTransferCount = 0
-    info.ProcessMemoryLimit = 0
-    info.JobMemoryLimit = 0
-    info.PeakProcessMemoryUsed = 0
-    info.PeakJobMemoryUsed = 0
 
     if not SetInformationJobObject(
         job,
