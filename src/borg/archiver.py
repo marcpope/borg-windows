@@ -5723,9 +5723,17 @@ def main():  # pragma: no cover
 
     # Register fault handler for SIGSEGV, SIGFPE, SIGABRT, SIGBUS and SIGILL.
     faulthandler.enable()
+    # SIGBREAK is a Windows-only signal delivered when a parent process sends
+    # CTRL_BREAK_EVENT to our process group (e.g. a supervisor agent cancelling
+    # the backup). Without an explicit handler Python's default action terminates
+    # the process, skipping context-manager teardown and potentially orphaning
+    # the ssh.exe child. Install a handler that raises SigTerm so we flow through
+    # the same orderly-exit path as SIGTERM on POSIX. signal_handler is a no-op
+    # on platforms that don't define this signal, so this is safe on POSIX.
     with signal_handler('SIGINT', raising_signal_handler(KeyboardInterrupt)), \
          signal_handler('SIGHUP', raising_signal_handler(SigHup)), \
          signal_handler('SIGTERM', raising_signal_handler(SigTerm)), \
+         signal_handler('SIGBREAK', raising_signal_handler(SigTerm)), \
          signal_handler('SIGUSR1', sig_info_handler), \
          signal_handler('SIGUSR2', sig_trace_handler), \
          signal_handler('SIGINFO', sig_info_handler):
