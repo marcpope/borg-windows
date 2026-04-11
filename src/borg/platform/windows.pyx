@@ -17,6 +17,7 @@ cdef extern from 'windows.h':
     ctypedef void* LPVOID
     ctypedef int BOOL
     ctypedef unsigned long DWORD
+    ctypedef unsigned long long ULONGLONG
     ctypedef unsigned short WORD
     ctypedef const char* LPCSTR
     ctypedef char* LPSTR
@@ -29,6 +30,43 @@ cdef extern from 'windows.h':
     void LocalFree(HANDLE hMem)
 
     cdef extern int PROCESS_QUERY_INFORMATION
+    cdef extern int PROCESS_SET_QUOTA
+    cdef extern int PROCESS_TERMINATE
+
+    # Job Object APIs for killing the ssh.exe child when borg exits.
+    HANDLE CreateJobObjectW(void* lpJobAttributes, LPCWSTR lpName)
+    BOOL SetInformationJobObject(HANDLE hJob, int JobObjectInfoClass, void* lpJobObjectInfo, DWORD cbJobObjectInfoLength)
+    BOOL AssignProcessToJobObject(HANDLE hJob, HANDLE hProcess)
+
+    cdef extern int JobObjectExtendedLimitInformation
+    cdef extern DWORD JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+
+    ctypedef struct IO_COUNTERS:
+        ULONGLONG ReadOperationCount
+        ULONGLONG WriteOperationCount
+        ULONGLONG OtherOperationCount
+        ULONGLONG ReadTransferCount
+        ULONGLONG WriteTransferCount
+        ULONGLONG OtherTransferCount
+
+    ctypedef struct JOBOBJECT_BASIC_LIMIT_INFORMATION:
+        long long PerProcessUserTimeLimit
+        long long PerJobUserTimeLimit
+        DWORD LimitFlags
+        size_t MinimumWorkingSetSize
+        size_t MaximumWorkingSetSize
+        DWORD ActiveProcessLimit
+        size_t Affinity
+        DWORD PriorityClass
+        DWORD SchedulingClass
+
+    ctypedef struct JOBOBJECT_EXTENDED_LIMIT_INFORMATION:
+        JOBOBJECT_BASIC_LIMIT_INFORMATION BasicLimitInformation
+        IO_COUNTERS IoInfo
+        size_t ProcessMemoryLimit
+        size_t JobMemoryLimit
+        size_t PeakProcessMemoryUsed
+        size_t PeakJobMemoryUsed
 
 
 # Security descriptor / ACL types
@@ -142,6 +180,98 @@ def process_alive(host, pid, thread):
 def local_pid_alive(pid):
     """Return whether *pid* is alive."""
     raise NotImplementedError
+
+
+# Module-level handle to the single "kill when borg exits" Job Object.
+# Created lazily on first use. When borg.exe exits (cleanly or via crash),
+# Windows closes its handles; the last handle to the job going away triggers
+# JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, which terminates every process still
+# assigned to the job. Caching the handle at module scope keeps it alive for
+# the whole borg process lifetime.
+cdef HANDLE _kill_on_exit_job = NULL
+
+
+cdef HANDLE _ensure_kill_on_exit_job() except? NULL:
+    """
+    Return a cached Job Object handle configured with
+    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE. Create it on first call.
+    """
+    global _kill_on_exit_job
+    cdef JOBOBJECT_EXTENDED_LIMIT_INFORMATION info
+    cdef HANDLE job
+
+    if _kill_on_exit_job != NULL:
+        return _kill_on_exit_job
+
+    job = CreateJobObjectW(NULL, NULL)
+    if job == NULL:
+        raise OSError(None, 'CreateJobObjectW failed', None, GetLastError())
+
+    # Zero-initialize the struct, then set only the kill-on-close limit flag.
+    info.BasicLimitInformation.PerProcessUserTimeLimit = 0
+    info.BasicLimitInformation.PerJobUserTimeLimit = 0
+    info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+    info.BasicLimitInformation.MinimumWorkingSetSize = 0
+    info.BasicLimitInformation.MaximumWorkingSetSize = 0
+    info.BasicLimitInformation.ActiveProcessLimit = 0
+    info.BasicLimitInformation.Affinity = 0
+    info.BasicLimitInformation.PriorityClass = 0
+    info.BasicLimitInformation.SchedulingClass = 0
+    info.IoInfo.ReadOperationCount = 0
+    info.IoInfo.WriteOperationCount = 0
+    info.IoInfo.OtherOperationCount = 0
+    info.IoInfo.ReadTransferCount = 0
+    info.IoInfo.WriteTransferCount = 0
+    info.IoInfo.OtherTransferCount = 0
+    info.ProcessMemoryLimit = 0
+    info.JobMemoryLimit = 0
+    info.PeakProcessMemoryUsed = 0
+    info.PeakJobMemoryUsed = 0
+
+    if not SetInformationJobObject(
+        job,
+        JobObjectExtendedLimitInformation,
+        &info,
+        sizeof(JOBOBJECT_EXTENDED_LIMIT_INFORMATION),
+    ):
+        err = GetLastError()
+        CloseHandle(job)
+        raise OSError(None, 'SetInformationJobObject failed', None, err)
+
+    _kill_on_exit_job = job
+    return _kill_on_exit_job
+
+
+def assign_process_to_kill_on_exit_job(int pid):
+    """
+    Assign *pid* to the process-wide kill-on-close Job Object so that Windows
+    terminates the process automatically when borg.exe exits, regardless of
+    how borg exited (clean, crash, SIGBREAK, force-kill).
+
+    This is used to make sure the ssh.exe child spawned by RemoteRepository
+    cannot outlive borg: the lingering-ssh problem that otherwise holds
+    server-side state (locks, network) until ssh's own I/O timeout fires.
+
+    Safe to call multiple times. Raises OSError on failure; callers should
+    log and continue — the worst case without a job is the pre-fix behavior,
+    which is not a regression.
+    """
+    cdef HANDLE job
+    cdef HANDLE hProcess
+
+    job = _ensure_kill_on_exit_job()
+    if job == NULL:
+        return
+
+    hProcess = OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, False, pid)
+    if hProcess == NULL:
+        raise OSError(None, 'OpenProcess failed', None, GetLastError())
+
+    try:
+        if not AssignProcessToJobObject(job, hProcess):
+            raise OSError(None, 'AssignProcessToJobObject failed', None, GetLastError())
+    finally:
+        CloseHandle(hProcess)
 
 
 def acl_get(path, item, st, numeric_ids=False, fd=None):

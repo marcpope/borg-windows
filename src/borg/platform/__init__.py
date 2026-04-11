@@ -26,6 +26,7 @@ else:
     from .windows import process_alive, local_pid_alive
     from .windows import uid2user, user2uid, gid2group, group2gid, getosusername
     from .windows import acl_get, acl_set
+    from .windows import assign_process_to_kill_on_exit_job
 
 if is_linux:  # pragma: linux only
     from .linux import API_VERSION as OS_API_VERSION

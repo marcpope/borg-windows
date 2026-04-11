@@ -588,9 +588,19 @@ class RemoteRepository:
         if is_win32:
             # preexec_fn is not supported on Windows; use CREATE_NEW_PROCESS_GROUP instead
             # to prevent Ctrl+C from propagating to the SSH child process.
-            import subprocess
             self.p = Popen(borg_cmd, bufsize=0, stdin=PIPE, stdout=PIPE, stderr=PIPE, env=env,
                            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP)
+            # Assign ssh.exe to a process-wide Job Object with KILL_ON_JOB_CLOSE.
+            # This guarantees ssh.exe dies when borg.exe exits (clean, crash, or
+            # force-kill) — the process-group isolation above prevents signals from
+            # reaching it, so without a job it would otherwise linger until its own
+            # network-read timeout. Failure here is non-fatal; log and continue.
+            try:
+                from .platform import assign_process_to_kill_on_exit_job
+                assign_process_to_kill_on_exit_job(self.p.pid)
+            except (OSError, ImportError) as e:
+                logger.warning('RemoteRepository: could not assign ssh child to kill-on-exit job: %s. '
+                               'ssh.exe may outlive borg.exe on force-kill.', e)
         else:
             self.p = Popen(borg_cmd, bufsize=0, stdin=PIPE, stdout=PIPE, stderr=PIPE, env=env, preexec_fn=ignore_sigint)
         self.stdin_fd = self.p.stdin.fileno()
