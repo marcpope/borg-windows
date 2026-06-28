@@ -31,6 +31,11 @@ This fork adds the ability to compile and run Borg natively on Windows (not thro
 - **`CTRL_BREAK_EVENT` handling**: borg on Windows now installs a `SIGBREAK` handler that raises `SigTerm`, so a parent supervisor (e.g. BBS agent) cancelling borg via `CTRL_BREAK_EVENT` flows through the normal orderly-exit path instead of skipping finalizers.
 - **Safer `RemoteRepository.close()` teardown**: closes stdin first, drains+joins the Windows reader threads, bounded `p.wait(timeout=30)` with `kill()` fallback, then closes stdout/stderr. This prevents an abortive pipe shutdown from racing the server's commit and leaving the server-side lock behind.
 
+### Local repo + connection-error fixes (v1.4.4-win7)
+
+- **Local drive-letter repositories** ([#7](https://github.com/marcpope/borg-windows/issues/7)): a repository given as a drive-letter path (`C:\repo`, `C:/repo`) was misparsed as an scp-style SSH target (host `C`) and hung trying to connect. `Location._parse` now recognizes drive-letter (and UNC) paths as local before the SSH/scp interpretation. `ssh://` and `user@host:path` remotes are unchanged.
+- **Cleaner broken-connection errors** ([#8](https://github.com/marcpope/borg-windows/issues/8)): on Windows a dropped SSH pipe surfaces as `OSError(EINVAL)` rather than `BrokenPipeError`, which slipped past borg's handler and produced a confusing double traceback. `RemoteRepository.write()` now treats `EINVAL`/`EBADF` on Windows as a broken connection and raises the normal `ConnectionBrokenWithHint`.
+
 ### Files modified
 | File | Change |
 |------|--------|
@@ -38,7 +43,8 @@ This fork adds the ability to compile and run Borg natively on Windows (not thro
 | `src/borg/platform/__init__.py` | Wire in Windows ACL imports and Job Object helper |
 | `src/borg/item.pyx` | Add `acl_windows` property |
 | `src/borg/constants.py` | Register `acl_windows` in `ITEM_KEYS` |
-| `src/borg/remote.py` | Windows SSH fixes + Job Object assignment + safer `close()` teardown |
+| `src/borg/remote.py` | Windows SSH fixes + Job Object assignment + safer `close()` teardown + `EINVAL`/`EBADF` broken-pipe handling |
+| `src/borg/helpers/parseformat.py` | `Location._parse` recognizes drive-letter/UNC local repo paths before scp/SSH |
 | `src/borg/archiver.py` | `SIGBREAK` handler on Windows; path-normalization fixes |
 | `src/borg/helpers/fs.py` | `make_path_safe` drive-letter to path-component conversion |
 | `src/borg/patterns.py`, `shellpattern.py` | Forward-slash pattern matching on Windows |
@@ -93,7 +99,7 @@ $env:BORG_LIBXXHASH_PREFIX = "C:\vcpkg\installed\x64-windows"
 
 # The fork uses tags of the form v1.4.4-winN which current setuptools_scm
 # rejects as non-PEP440. Override the version explicitly for the build:
-$env:SETUPTOOLS_SCM_PRETEND_VERSION = "1.4.4+win6"
+$env:SETUPTOOLS_SCM_PRETEND_VERSION = "1.4.4+win7"
 
 # Install Python dependencies
 pip install -r requirements.d/development.txt

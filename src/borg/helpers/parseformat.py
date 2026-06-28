@@ -459,6 +459,17 @@ class Location:
                 self.path = normpath_special_remote(m.group('path'))
                 self.archive = m.group('archive')
                 return True
+            # A drive-letter path (C:\repo or C:/repo) is a LOCAL Windows path,
+            # not an scp-style host:path remote. Detect it before scp_re, which
+            # would otherwise misparse the leading drive letter as an SSH hostname
+            # (e.g. C:\repo -> host "C") and try to ssh there.
+            if re.match(r"[A-Za-z]:[\\/]", text):
+                m = self.win_file_re.match(text)
+                if m:
+                    self.proto = 'file'
+                    self.path = m.group('path')
+                    self.archive = m.group('archive')
+                    return True
             # Try SCP style (user@host:path::archive)
             m = self.scp_re.match(text)
             if m:

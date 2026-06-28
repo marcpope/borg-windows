@@ -440,6 +440,14 @@ class SleepingBandwidthLimiter:
             written = os.write(fd, to_send)
         except BrokenPipeError:
             raise ConnectionBrokenWithHint("Broken Pipe") from None
+        except OSError as e:
+            # On Windows, writing to a pipe whose read end has gone away does not
+            # raise BrokenPipeError like on POSIX. It surfaces as EINVAL (errno 22),
+            # and sometimes EBADF, so handle those the same as a broken pipe instead
+            # of letting an unhandled OSError mask the real connection error.
+            if is_win32 and e.errno in (errno.EINVAL, errno.EBADF):
+                raise ConnectionBrokenWithHint("Broken Pipe") from None
+            raise
         if self.ratelimit:
             self.ratelimit_quota -= written
         return written
