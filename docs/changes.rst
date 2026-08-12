@@ -414,11 +414,103 @@ Compatibility notes:
 Change Log
 ==========
 
-Version 1.4.4 (2026-03-19)
+Version 1.4.5 (2026-07-19)
 --------------------------
 
 For upgrade and compatibility hints, please also read the "Upgrade Notes" section
 above.
+
+New features:
+
+- create/import-tar/delete/prune --quick-stats: faster than --stats by omitting "All archives"
+  and repository chunk statistics, #9579, #9757
+- prune: show total vs matching archives in output, #9262
+- create --exclude-dataless: macOS: skip cloud files not materialized locally, #9746
+- support BORG_HOSTNAME and BORG_USERNAME env vars to override the hostname/username stored
+  in archives and used by the {hostname}/{user} placeholders, #9651
+- Minimal implementation of "related repositories", #9645
+
+  This feature allows multiple repositories to share deduplication-relevant secrets
+  (id_key and chunk_seed) while maintaining secure, independent encryption keys.
+
+  - borg key export-related-secrets <REPO> <SPATH>
+  - borg init --import-related-secrets <SPATH> <REPO>
+- BORG_JSON_INDENT env var for JSON output formatting, #3605
+- BORG_HOSTNAME and BORG_USERNAME env vars, #9651
+
+Fixes:
+
+- extract: security fixes for CVE-2026-62268 (low severity: attacker would need
+  repository write access and, if the repo is encrypted, also borg key and passphrase).
+- create: do not wrap repository writes in backup_io("read"), #9854
+- Archive.delete: don't reuse msgpack Unpacker after an unpacking failure
+- slashdot hack: fix exclusion of source directory metadata, #9534
+- hashindex: fix new checks for big endian archs, #9521
+
+- Note:
+
+    Many of the fixed issues listed below relate to rather rare or theoretical
+    issues and were found by automated code checking.
+
+- LRUCache: resolve KeyError and memory leaks, #9587
+- crypto.low_level: fix freeing of memory, #9585
+- extract: resolve memory leak on abandoned async requests in RemoteRepository, #9588.
+  This can happen if borg fails to extract a file due to permission or other errors
+  or if the archived file had all-zero replacement chunks or inconsistent size.
+- Chunker fixes, #9586:
+
+  - Strictly check the return value of fd.read(n) and reject if it returns more
+    bytes than requested.
+  - Avoid giving len <= 0 to posix_fadvise(), which could drop the rest of the
+    file from the cache.
+  - buzhash: check for len == 0 edge case
+  - Correctly Py_DECREF in cases of errors.
+  - Check for malloc/calloc failures.
+- Hashindex fixes, #9575:
+
+  - Make it possible to look up in compacted hashtables.
+  - Avoid buckets_length integer overflow on 32-bit systems via huge num_buckets.
+  - Deal safely with empty index: we must use num_buckets = 1 to avoid division
+    by zero and sanity check in hashindex_read.
+  - Always initialize min_empty and num_empty.
+  - Reinitialize upper/lower limit and min_empty after compact.
+  - Fix size_idx / fit_size / grow_size / shrink_size (mind array bounds).
+  - Deal with growing when already at max capacity.
+  - hashindex_resize: replace num_entries assertion, return an error instead.
+  - Correctly free memory when header validation fails.
+  - BaseIndex.clear: always stay in valid state.
+    Do not free the old index before we successfully have allocated a new one.
+
+Other changes:
+
+- msgpack: also allow up to 1.2.1
+- use F_FULLFSYNC on macOS for SyncFile data durability, #9383
+- mount: drop runtime warning about symlinks and improve corresponding docs
+- mount: improve error msg when uid/gid cannot be resolved, #9574
+- properly handle invalid and dev versions in version parser, fixes #9014
+- tests: reset borg.output.progress logger between tests to fix flakiness
+- docs:
+
+  - borgbackup.readthedocs.io: offer PDF and html downloads in sidebar, #9731
+  - fix 'borg key change-passphrase' docs, #9697
+  - impact of the slashdot hack on pattern matching, #9647
+  - pull-backup.rst minor fixes
+  - sshfs + chroot does not support different CPU architectures, #6878
+  - document max_segment_size adjustment, #7858
+  - add section about rolling back a transaction, #9270
+  - clarify storage quota run-time settings, #3948
+  - add FAQ entry about scalability, #4742
+  - add FAQ entry for full repository filesystem, #9573
+  - add FAQ entry for bad backups and deduplication, #4744
+  - add FAQ entry for SSH connection timeouts, #5629
+  - improve macOS Keychain instructions, #5156
+  - add DoS warning for none encryption mode, #6715
+  - document error handling in borg create, #4912
+  - update year in LICENSE and docs/conf.py
+
+
+Version 1.4.4 (2026-03-19)
+--------------------------
 
 New features:
 

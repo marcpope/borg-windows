@@ -9,6 +9,7 @@ import unittest
 from ..platformflags import is_win32, is_linux, is_freebsd, is_netbsd, is_darwin, is_haiku
 from ..platform import acl_get, acl_set, swidth
 from ..platform import get_process_id, process_alive
+from ..platform import fdatasync, sync_dir
 from . import BaseTestCase, unopened_tempfile
 from .locking import free_pid
 
@@ -308,6 +309,68 @@ class PlatformWindowsTestCase(BaseTestCase):
         acl_set(file.name, {})
         restored = self.get_acl(file.name)['acl_windows']
         self.assert_equal(original, restored)
+
+
+@unittest.skipUnless(is_darwin, 'macOS only test')
+def test_fdatasync_uses_f_fullfsync(monkeypatch):
+    import fcntl as fcntl_mod
+    from ..platform import darwin
+
+    calls = []
+    original_fcntl = fcntl_mod.fcntl
+
+    def mock_fcntl(fd, cmd, *args):
+        calls.append((fd, cmd))
+        return original_fcntl(fd, cmd, *args)
+
+    monkeypatch.setattr(fcntl_mod, 'fcntl', mock_fcntl)
+
+    with tempfile.NamedTemporaryFile() as tmp:
+        tmp.write(b'test data')
+        tmp.flush()
+        darwin.fdatasync(tmp.fileno())
+
+    assert any(cmd == fcntl_mod.F_FULLFSYNC for _, cmd in calls), 'fdatasync should call fcntl with F_FULLFSYNC'
+
+
+@unittest.skipUnless(is_darwin, 'macOS only test')
+def test_fdatasync_falls_back_to_fsync(monkeypatch):
+    import fcntl as fcntl_mod
+    from ..platform import darwin
+
+    fsync_calls = []
+
+    def mock_fcntl(fd, cmd, *args):
+        if cmd == fcntl_mod.F_FULLFSYNC:
+            raise OSError('F_FULLFSYNC not supported')
+        return 0
+
+    def mock_fsync(fd):
+        fsync_calls.append(fd)
+
+    # Cython does runtime attribute lookup on module objects, so patching
+    # fcntl.fcntl and os.fsync here affects darwin.fdatasync as expected.
+    monkeypatch.setattr(fcntl_mod, 'fcntl', mock_fcntl)
+    monkeypatch.setattr(os, 'fsync', mock_fsync)
+
+    with tempfile.NamedTemporaryFile() as tmp:
+        tmp.write(b'test data')
+        tmp.flush()
+        darwin.fdatasync(tmp.fileno())
+
+    assert len(fsync_calls) == 1, 'Should fall back to os.fsync when F_FULLFSYNC fails'
+
+
+def test_fdatasync_basic():
+    with tempfile.NamedTemporaryFile() as tmp:
+        tmp.write(b'test data for fdatasync')
+        tmp.flush()
+        fdatasync(tmp.fileno())
+
+
+def test_sync_dir_basic():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        sync_dir(tmpdir)
 
 
 @unittest.skipUnless(sys.platform.startswith(('linux', 'freebsd', 'darwin')), 'POSIX only tests')

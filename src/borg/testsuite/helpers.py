@@ -796,21 +796,21 @@ class TestBuffer:
 def test_yes_input():
     inputs = list(TRUISH)
     input = FakeInputs(inputs)
-    for i in inputs:
+    while input.available():
         assert yes(input=input)
     inputs = list(FALSISH)
     input = FakeInputs(inputs)
-    for i in inputs:
+    while input.available():
         assert not yes(input=input)
 
 
 def test_yes_input_defaults():
     inputs = list(DEFAULTISH)
     input = FakeInputs(inputs)
-    for i in inputs:
+    while input.available():
         assert yes(default=True, input=input)
     input = FakeInputs(inputs)
-    for i in inputs:
+    while input.available():
         assert not yes(default=False, input=input)
 
 
@@ -1239,3 +1239,31 @@ def test_ec_invalid():
 ))
 def test_max_ec(ec1, ec2, ec_max):
     assert max_ec(ec1, ec2) == ec_max
+
+@pytest.mark.parametrize(
+    'env_value, expect_newlines',
+    [
+        (None, True),
+        ('none', False),
+        ('0', True),
+        ('4', True),
+        ('', True),
+        ('\t', True),
+    ],
+)
+def test_json_dump_indent(monkeypatch, env_value, expect_newlines):
+    from ..helpers import json_dump
+    import json
+
+    obj = {'key': 'value', 'number': 42}
+    if env_value is not None:
+        monkeypatch.setenv('BORG_JSON_INDENT', env_value)
+    else:
+        monkeypatch.delenv('BORG_JSON_INDENT', raising=False)
+
+    result = json_dump(obj)
+    if expect_newlines:
+        assert '\n' in result
+    else:
+        assert '\n' not in result
+    assert json.loads(result) == obj

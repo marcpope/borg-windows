@@ -109,6 +109,11 @@ assert EXIT_ERROR == 2, "EXIT_ERROR is not 2, as expected - fix assert AND excep
 
 STATS_HEADER = "                       Original size      Compressed size    Deduplicated size"
 
+# macOS: SF_DATALESS marks dataless placeholder files (e.g. cloud files not materialized locally).
+# Reading such files triggers downloading their content. stat.SF_DATALESS is only available
+# from Python 3.13 on, thus we fall back to the value from macOS' sys/stat.h.
+SF_DATALESS = getattr(stat, 'SF_DATALESS', 0x40000000)
+
 PURE_PYTHON_MSGPACK_WARNING = "Using a pure-python msgpack! This will result in lower performance."
 
 
@@ -283,6 +288,25 @@ class Archiver:
                 logging.getLogger('borg.output.list').info("%1s %s", status, remove_surrogates(path))
 
     @staticmethod
+    def print_archive_stats(manifest, cache, archive, *, output_json, quick_stats):
+        if output_json:
+            json_print(basic_json_data(manifest, cache=None if quick_stats else cache, extra={
+                'archive': archive,
+            }))
+        else:
+            parts = [
+                DASHES,
+                str(archive),
+                DASHES,
+                STATS_HEADER,
+                str(archive.stats),
+            ]
+            if not quick_stats:
+                parts.append(str(cache))
+            parts.append(DASHES)
+            log_multi(*parts, logger=logging.getLogger('borg.output.stats'))
+
+    @staticmethod
     def build_matcher(inclexcl_patterns, include_paths):
         matcher = PatternMatcher()
         matcher.add_inclexcl(inclexcl_patterns)
@@ -314,8 +338,21 @@ class Archiver:
         """Initialize an empty repository"""
         path = args.location.canonical_path()
         logger.info('Initializing repository at "%s"' % path)
+        related_secrets = None
+        if args.import_related_secrets:
+            with dash_open(args.import_related_secrets, 'r') as fd:
+                try:
+                    related_secrets = json.load(fd)
+                except ValueError:
+                    raise CommandError(f"Invalid JSON in related secrets file: {args.import_related_secrets}")
+            if related_secrets.get('version') != 1:
+                raise CommandError(f"Unsupported related secrets version: {related_secrets.get('version')}")
+            try:
+                related_secrets['id_key'] = hex_to_bin(related_secrets['id_key'])
+            except (KeyError, ValueError):
+                raise CommandError(f"Invalid id_key in related secrets file: {args.import_related_secrets}")
         try:
-            key = key_creator(repository, args)
+            key = key_creator(repository, args, related_secrets=related_secrets)
         except (EOFError, KeyboardInterrupt):
             repository.destroy()
             raise CancelledByUser()
@@ -393,6 +430,19 @@ class Archiver:
         if hasattr(key, 'find_key'):
             # print key location to make backing it up easier
             logger.info('Key location: %s', key.find_key())
+
+    @with_repository(manifest=True, compatibility=(Manifest.Operation.READ,))
+    def do_key_export_related_secrets(self, args, repository, manifest, key):
+        """Export secrets for creating related repositories"""
+        secrets = {
+            'version': 1,
+            'id_key': bin_to_hex(key.id_key),
+            'chunk_seed': key.chunk_seed,
+            'key_name': key.NAME,
+        }
+        with dash_open(args.path, 'w') as fd:
+            json.dump(secrets, fd, indent=4)
+            fd.write('\n')
 
     @with_repository(lock=False, exclusive=False, manifest=False, cache=False)
     def do_key_export(self, args, repository):
@@ -648,20 +698,9 @@ class Archiver:
                     raise Error("Got Ctrl-C / SIGINT.")
                 else:
                     archive.save(comment=args.comment, timestamp=args.timestamp)
-                    args.stats |= args.json
-                    if args.stats:
-                        if args.json:
-                            json_print(basic_json_data(manifest, cache=cache, extra={
-                                'archive': archive,
-                            }))
-                        else:
-                            log_multi(DASHES,
-                                      str(archive),
-                                      DASHES,
-                                      STATS_HEADER,
-                                      str(archive.stats),
-                                      str(cache),
-                                      DASHES, logger=logging.getLogger('borg.output.stats'))
+                    if args.stats or args.quick_stats or args.json:
+                        self.print_archive_stats(manifest, cache, archive,
+                                                 output_json=args.json, quick_stats=args.quick_stats)
 
         self.output_filter = args.output_filter
         self.output_list = args.output_list
@@ -669,6 +708,7 @@ class Archiver:
         self.noacls = args.noacls
         self.noxattrs = args.noxattrs
         self.exclude_nodump = args.exclude_nodump
+        self.exclude_dataless = args.exclude_dataless
         dry_run = args.dry_run
         t0 = utcnow()
         t0_monotonic = time.monotonic()
@@ -794,12 +834,18 @@ class Archiver:
             # directory of the mounted filesystem that shadows the mountpoint dir).
             recurse = restrict_dev is None or st.st_dev == restrict_dev
 
-            if self.exclude_nodump:
-                # Ignore if nodump flag is set
+            if self.exclude_nodump or self.exclude_dataless:
                 with backup_io('flags'):
-                    if get_flags(path=path, st=st) & stat.UF_NODUMP:
-                        self.print_file_status('x', path)
-                        return
+                    flags = get_flags(path=path, st=st)
+                # Ignore if nodump flag is set
+                if self.exclude_nodump and flags & stat.UF_NODUMP:
+                    self.print_file_status('x', path)
+                    return
+                # Ignore if dataless flag is set (macOS: content not materialized locally,
+                # reading the file would trigger downloading it from cloud storage)
+                if self.exclude_dataless and flags & SF_DATALESS:
+                    self.print_file_status('x', path)
+                    return
 
             if not stat.S_ISDIR(st.st_mode):
                 # directories cannot go in this branch because they can be excluded based on tag
@@ -1375,11 +1421,11 @@ class Archiver:
                 raise Error("Got Ctrl-C / SIGINT.")
             elif uncommitted_deletes > 0:
                 checkpoint_func()
-            if args.stats:
+            if args.stats or args.quick_stats:
                 log_multi(DASHES,
                           STATS_HEADER,
                           stats.summary.format(label='Deleted data:', stats=stats),
-                          str(cache),
+                          *([] if args.quick_stats else [str(cache)]),
                           DASHES, logger=logging.getLogger('borg.output.stats'))
 
     def _delete_repository(self, args, repository):
@@ -1661,7 +1707,16 @@ class Archiver:
         to_delete = (set(archives) | checkpoints) - (set(keep) | set(keep_checkpoints))
         pruned_checkpoints_len = len(set(checkpoints) - set(keep_checkpoints))
         pruned_archives_len = len(to_delete) - pruned_checkpoints_len
-        logger.info('Found %d normal archives and %d checkpoint archives.',
+        total_archives_count = 0
+        total_checkpoints_count = 0
+        for name in manifest.archives:
+            if is_checkpoint(name):
+                total_checkpoints_count += 1
+            else:
+                total_archives_count += 1
+        logger.info('Repository contains %d normal archives and %d checkpoint archives.',
+                    total_archives_count, total_checkpoints_count)
+        logger.info('Applying rules to the matching %d archives and %d checkpoints...',
                     len(archives), len(checkpoints))
         logger.info('Keeping %d archives and %d checkpoints, pruning %d archives and %d checkpoints.',
                     len(keep), len(keep_checkpoints), pruned_archives_len, pruned_checkpoints_len)
@@ -1711,11 +1766,11 @@ class Archiver:
                 raise Error("Got Ctrl-C / SIGINT.")
             elif uncommitted_deletes > 0:
                 checkpoint_func()
-            if args.stats:
+            if args.stats or args.quick_stats:
                 log_multi(DASHES,
                           STATS_HEADER,
                           stats.summary.format(label='Deleted data:', stats=stats),
-                          str(cache),
+                          *([] if args.quick_stats else [str(cache)]),
                           DASHES, logger=logging.getLogger('borg.output.stats'))
 
     @with_repository(fake=('tam', 'check_tam', 'disable_tam', 'archives_tam', 'check_archives_tam'), invert_fake=True, manifest=False, exclusive=True)
@@ -1937,20 +1992,9 @@ class Archiver:
             archive.stats.show_progress(final=True)
         archive.stats += tfo.stats
         archive.save(comment=args.comment, timestamp=args.timestamp)
-        args.stats |= args.json
-        if args.stats:
-            if args.json:
-                json_print(basic_json_data(archive.manifest, cache=archive.cache, extra={
-                    'archive': archive,
-                }))
-            else:
-                log_multi(DASHES,
-                          str(archive),
-                          DASHES,
-                          STATS_HEADER,
-                          str(archive.stats),
-                          str(archive.cache),
-                          DASHES, logger=logging.getLogger('borg.output.stats'))
+        if args.stats or args.quick_stats or args.json:
+            self.print_archive_stats(archive.manifest, archive.cache, archive,
+                                     output_json=args.json, quick_stats=args.quick_stats)
 
     @with_repository(manifest=False, exclusive=True)
     def do_with_lock(self, args, repository):
@@ -2438,6 +2482,10 @@ class Archiver:
             start with ``src``.
           - When you back up relative paths like ``../../src``, the archived paths
             start with ``src``.
+
+        - When using the slashdot hack, patterns match against the unstripped path,
+          i.e., when you back up ``/this/gets/stripped/./this/gets/archived``,
+          patterns must match ``this/gets/stripped/this/gets/archived``.
 
         A directory exclusion pattern can end either with or without a slash ('/').
         If it ends with a slash, such as `some/path/`, the directory will be
@@ -3052,6 +3100,7 @@ class Archiver:
             'borg_key_export': 'borg key export --help',
             'borg_key_change-passphrase': 'borg key change-passphrase',
             'environment-variables': 'Environment Variables',
+            'internals_hashindex': 'Internals -> Data structures and file formats -> HashIndex',
         }
 
         def process_epilog(epilog):
@@ -3234,10 +3283,26 @@ class Archiver:
         archives and the directory structure below these will be loaded on-demand from
         the repository when entering these directories, so expect some delay.
 
-        Care should be taken, as Borg backs up symlinks as-is. When an archive
-        or repository is mounted, it is possible to “jump” outside the mount point
-        by following a symlink. If this happens, files or directories (or versions of them)
-        that are not part of the archive or repository may appear to be within the mount point.
+        .. note::
+
+            Borg stores symbolic links as-is. Consequently, when an archive or
+            repository is mounted, symbolic links may resolve to locations outside of
+            the mountpoint, either because they are absolute or because relative links
+            traverse outside of the mounted tree.
+
+            Normal UNIX pathname resolution applies: most tools follow symbolic links
+            by default and may therefore access files or directories that are not part
+            of the mounted archive. Consequently, operations intended to inspect
+            archived data may instead access "live" data from the host filesystem.
+
+            On Linux, this can be prevented by remounting the mountpoint with the
+            ``nosymfollow`` VFS mount option, for example:
+
+                borg mount <repo path> <mountpoint>
+                mount -o remount,nosymfollow <repo path> <mountpoint>
+
+            Alternatively, access the mounted archive from an appropriately isolated
+            environment (for example, a container or ``chroot``).
 
         Unless the ``--foreground`` option is given the command will run in the
         background until the filesystem is ``unmounted``.
@@ -3706,7 +3771,9 @@ class Archiver:
         When using ``--stats``, you will get some statistics about how much data was
         added - the "This Archive" deduplicated size there is most interesting as that is
         how much your repository will grow. Please note that the "All archives" stats refer to
-        the state after creation. Also, the ``--stats`` and ``--dry-run`` options are mutually
+        the state after creation. ``--stats`` can be slow - if you want something faster, use
+        ``--quick-stats`` (this skips the repository-wide "All archives" and chunk index statistics).
+        The ``--stats`` / ``--quick-stats`` and ``--dry-run`` options are mutually
         exclusive because the data is not actually compressed and deduplicated during a dry run.
 
         For more help on include/exclude patterns, see the :ref:`borg_patterns` command output.
@@ -3740,6 +3807,20 @@ class Archiver:
         Therefore, when using ``--one-file-system``, you should double-check that the backup works as intended.
 
 
+        Error handling
+        ++++++++++++++
+ 
+        When Borg encounters a file or directory it cannot read (e.g., due to permission
+        denied, or another process holding an exclusive lock on Windows), it will:
+ 
+        - Log a warning message.
+        - Skip that file or directory and continue backing up the remaining files.
+        - Exit with a Warning RC at the end of the operation.
+ 
+        This ensures that a single problematic file does not abort your entire backup.
+        You should check your logs for these warnings to ensure that all important data
+        is being backed up.
+ 
         .. _list_item_flags:
 
         Item flags
@@ -3844,6 +3925,8 @@ class Archiver:
                                help='do not create a backup archive')
         subparser.add_argument('-s', '--stats', dest='stats', action='store_true',
                                help='print statistics for the created archive')
+        subparser.add_argument('--quick-stats', dest='quick_stats', action='store_true',
+                               help='print only archive statistics, skipping repository-wide statistics')
 
         subparser.add_argument('--list', dest='output_list', action='store_true',
                                help='output verbose list of items (files, dirs, ...)')
@@ -3875,6 +3958,9 @@ class Archiver:
         exclude_group = define_exclusion_group(subparser, tag_files=True)
         exclude_group.add_argument('--exclude-nodump', dest='exclude_nodump', action='store_true',
                                    help='exclude files flagged NODUMP')
+        exclude_group.add_argument('--exclude-dataless', dest='exclude_dataless', action='store_true',
+                                   help='exclude files flagged DATALESS (macOS: placeholder files whose content '
+                                        'is not materialized locally, e.g. not-downloaded cloud storage files)')
 
         fs_group = subparser.add_argument_group('Filesystem options')
         fs_group.add_argument('-x', '--one-file-system', dest='one_file_system', action='store_true',
@@ -4168,6 +4254,9 @@ class Archiver:
         deleted - the "Deleted data" deduplicated size there is most interesting as
         that is how much your repository will shrink.
         Please note that the "All archives" stats refer to the state after deletion.
+        ``--stats`` can be slow - if you want something faster, use ``--quick-stats``
+        (this skips the repository-wide "All archives" statistics).
+        The ``--stats`` / ``--quick-stats`` and ``--dry-run`` options are mutually exclusive.
 
         You can delete multiple archives by specifying a shell pattern to match
         multiple archives using the ``--glob-archives GLOB`` option (for more info on
@@ -4189,6 +4278,8 @@ class Archiver:
                                help='output verbose list of archives')
         subparser.add_argument('-s', '--stats', dest='stats', action='store_true',
                                help='print statistics for the deleted archive')
+        subparser.add_argument('--quick-stats', dest='quick_stats', action='store_true',
+                               help='print only deletion statistics, skipping repository-wide statistics')
         subparser.add_argument('--cache-only', dest='cache_only', action='store_true',
                                help='delete only the local cache for the given repository')
         subparser.add_argument('--force', dest='forced', action='count', default=0,
@@ -4311,7 +4402,7 @@ class Archiver:
                                help='Override check of chunker parameters.')
         subparser.add_argument('--sort', dest='sort', action='store_true',
                                help='Sort the output by path (deprecated, use --sort-by=path).')
-        subparser.add_argument('--sort-by', dest='sort_by', metavar='FIELD[,FIELD...]', type=diff_sort_spec_validator,
+        subparser.add_argument('--sort-by', dest='sort_by', metavar='FIELDS', type=diff_sort_spec_validator,
                                action=Highlander,
                                help='Advanced sorting: specify field(s) to sort by. Accepts a comma-separated list. Prefix with > for descending or < for ascending (default).')
         subparser.add_argument(
@@ -4632,17 +4723,16 @@ class Archiver:
         .. nanorst: inline-fill
         .. class:: borg-encryption-table
 
-        +----------+-------------------+--------------------------+-------------------------+
-        | Hash/MAC | Not Encrypted                                | Encrypted (AEAD w/ AES) |
-        +          +-------------------+--------------------------+-------------------------+
-        |          | Not Authenticated | Authenticated                                      |
-        +==========+===================+==========================+=========================+
-        | SHA-256  | ``none``          | ``authenticated``        | ``repokey``             |
-        |          |                   |                          | ``keyfile``             |
-        +----------+-------------------+--------------------------+-------------------------+
-        | BLAKE2b  | n/a               | ``authenticated-blake2`` | ``repokey-blake2``      |
-        |          |                   |                          | ``keyfile-blake2``      |
-        +----------+-------------------+--------------------------+-------------------------+
+        +----------+-------------------+--------------------------+--------------------------+
+        | Hash/MAC | Not encrypted,    | Not encrypted,           | Encrypted (AEAD w/ AES), |
+        |          | not authenticated | authenticated            | authenticated            |
+        +==========+===================+==========================+==========================+
+        | SHA-256  | ``none``          | ``authenticated``        | ``repokey``              |
+        |          |                   |                          | ``keyfile``              |
+        +----------+-------------------+--------------------------+--------------------------+
+        | BLAKE2b  | n/a               | ``authenticated-blake2`` | ``repokey-blake2``       |
+        |          |                   |                          | ``keyfile-blake2``       |
+        +----------+-------------------+--------------------------+--------------------------+
 
         .. nanorst: inline-replace
 
@@ -4732,11 +4822,11 @@ class Archiver:
         compatible with Borg 1.1 and later.
 
         ``none`` mode uses no encryption and no authentication. It uses SHA256
-        as chunk ID hash. This mode is not recommended. You should instead
-        consider using an authenticated or authenticated/encrypted mode. This
-        mode has possible denial-of-service issues when running ``borg create``
-        on contents controlled by an attacker. See above for alternatives.
-        This mode is compatible with all Borg versions.
+        as chunk ID hash. This mode is not recommended
+        as it is vulnerable to DoS attacks by an attacker (for example,
+        crafting content that causes hash index collisions). Do not use it if
+        untrusted clients use the repository. See :ref:`internals_hashindex` for
+        details. This mode is compatible with all Borg versions.
         """)
         subparser = subparsers.add_parser('init', parents=[common_parser], add_help=False,
                                           description=self.do_init.__doc__, epilog=init_epilog,
@@ -4759,6 +4849,8 @@ class Archiver:
                                help='Set storage quota of the new repository (e.g. 5G, 1.5T). Default: no quota.')
         subparser.add_argument('--make-parent-dirs', dest='make_parent_dirs', action='store_true',
                                help='create the parent directories of the repository directory, if they are missing.')
+        subparser.add_argument('--import-related-secrets', metavar='PATH', dest='import_related_secrets',
+                               type=PathSpec, help='import related secrets from PATH')
 
         # borg key
         subparser = subparsers.add_parser('key', parents=[mid_common_parser], add_help=False,
@@ -4825,6 +4917,54 @@ class Archiver:
                                help='Create an export suitable for printing and later type-in')
         subparser.add_argument('--qr-html', dest='qr', action='store_true',
                                help='Create an html file suitable for printing and later type-in or qr scan')
+
+        export_related_secrets_epilog = process_epilog("""
+        This command exports the deduplication secrets (``id_key`` and ``chunk_seed``)
+        of a repository. These secrets can be used to initialize a **related repository**.
+
+        Related repositories share the same deduplication metadata but have their own
+        independent encryption keys. This is useful for:
+
+        1. Creating independent backup targets that still benefit from being
+           "compatible" for future archive transfers.
+        2. Preparing for a migration to Borg 2.0, where archives can be transferred
+           between related repositories using ``borg transfer``.
+
+        The exported secrets are stored in a JSON file. This file contains sensitive
+        information and should be deleted immediately after usage.
+
+        Examples::
+
+            # Export secrets from an existing repository
+            $ borg key export-related-secrets /path/to/repo1 secrets.json
+
+            # Initialize a new related repository using these secrets
+            $ borg init --import-related-secrets=secrets.json --encryption=repokey /path/to/repo2
+            $ rm secrets.json
+
+        .. IMPORTANT::
+           When initializing a related repository using ``borg init --import-related-secrets``,
+           the new repository must use the same ID hash algorithm (either both HMAC-SHA256
+           or both BLAKE2) as the original repository.
+
+           - HMAC-SHA256: ``repokey``, ``keyfile``, ``authenticated``
+           - BLAKE2: ``repokey-blake2``, ``keyfile-blake2``, ``authenticated-blake2``
+
+        .. WARNING::
+           Please note that future Borg 2.0 versions might remove support for BLAKE2
+           in new repositories (see :issue:`8867`).
+        """)
+
+        subparser = key_parsers.add_parser('export-related-secrets', parents=[common_parser], add_help=False,
+                                          description=self.do_key_export_related_secrets.__doc__,
+                                          epilog=export_related_secrets_epilog,
+                                          formatter_class=argparse.RawDescriptionHelpFormatter,
+                                          help='export related secrets for related repositories')
+        subparser.set_defaults(func=self.do_key_export_related_secrets)
+        subparser.add_argument('location', metavar='REPOSITORY', nargs='?', default='',
+                               type=location_validator(archive=False))
+        subparser.add_argument('path', metavar='PATH', nargs='?', type=PathSpec,
+                               help='where to store the secrets')
 
         key_import_epilog = process_epilog("""
         This command restores a key previously backed up with the export command.
@@ -5049,6 +5189,9 @@ class Archiver:
         deleted - the "Deleted data" deduplicated size there is most interesting as
         that is how much your repository will shrink.
         Please note that the "All archives" stats refer to the state after pruning.
+        ``--stats`` can be slow - if you want something faster, use ``--quick-stats``
+        (this skips the repository-wide "All archives" statistics).
+        The ``--stats`` / ``--quick-stats`` and ``--dry-run`` options are mutually exclusive.
         """)
         subparser = subparsers.add_parser('prune', parents=[common_parser], add_help=False,
                                           description=self.do_prune.__doc__,
@@ -5063,6 +5206,8 @@ class Archiver:
                                     'use ``--force --force`` in case ``--force`` does not work.')
         subparser.add_argument('-s', '--stats', dest='stats', action='store_true',
                                help='print statistics for the deleted archive')
+        subparser.add_argument('--quick-stats', dest='quick_stats', action='store_true',
+                               help='print only deletion statistics, skipping repository-wide statistics')
         subparser.add_argument('--list', dest='output_list', action='store_true',
                                help='output verbose list of archives it keeps/prunes')
         subparser.add_argument('--keep-within', metavar='INTERVAL', dest='within', type=interval,
@@ -5255,7 +5400,8 @@ class Archiver:
                                     'See :ref:`append_only_mode` in Additional Notes for more details.')
         subparser.add_argument('--storage-quota', metavar='QUOTA', dest='storage_quota',
                                type=parse_storage_quota, default=None,
-                               help='Override storage quota of the repository (e.g. 5G, 1.5T). '
+                               help='Set storage quota of the repository (has priority over the '
+                                    'repository\'s own quota setting) (e.g. 5G, 1.5T). '
                                     'When a new repository is initialized, sets the storage quota on the new '
                                     'repository as well. Default: no quota.')
 
@@ -5483,6 +5629,8 @@ class Archiver:
         subparser.add_argument('-s', '--stats', dest='stats',
                                action='store_true', default=False,
                                help='print statistics for the created archive')
+        subparser.add_argument('--quick-stats', dest='quick_stats', action='store_true',
+                               help='print only archive statistics, skipping repository-wide statistics')
         subparser.add_argument('--list', dest='output_list',
                                action='store_true', default=False,
                                help='output verbose list of items (files, dirs, ...)')
@@ -5588,6 +5736,8 @@ class Archiver:
                 raise Error('Not allowed to bypass locking mechanism for chosen command')
         if getattr(args, 'timestamp', None):
             args.location = args.location.with_timestamp(args.timestamp)
+        if getattr(args, 'stats', False) and getattr(args, 'quick_stats', False):
+            parser.error('--stats and --quick-stats are mutually exclusive.')
         return args
 
     def prerun_checks(self, logger, is_serve):
@@ -5610,6 +5760,8 @@ class Archiver:
         for option, logger_name in option_logger.items():
             option_set = args.get(option, False)
             logging.getLogger(logger_name).setLevel('INFO' if option_set else 'WARN')
+        if args.get('quick_stats', False):
+            logging.getLogger('borg.output.stats').setLevel('INFO')
 
     def _setup_topic_debugging(self, args):
         """Turn on DEBUG level logging for specified --debug-topics."""
@@ -5630,11 +5782,17 @@ class Archiver:
         args.progress |= is_serve
         self._setup_implied_logging(vars(args))
         self._setup_topic_debugging(args)
-        if getattr(args, 'stats', False) and getattr(args, 'dry_run', False):
-            # the data needed for --stats is not computed when using --dry-run, so we can't do it.
-            # for ease of scripting, we just ignore --stats when given with --dry-run.
-            logger.warning("Ignoring --stats. It is not supported when using --dry-run.")
-            args.stats = False
+        if getattr(args, 'dry_run', False):
+            if getattr(args, 'stats', False):
+                # the data needed for --stats is not computed when using --dry-run, so we can't do it.
+                # for ease of scripting, we just ignore --stats when given with --dry-run.
+                logger.warning("Ignoring --stats. It is not supported when using --dry-run.")
+                args.stats = False
+            if getattr(args, 'quick_stats', False):
+                # the data needed for --quick-stats is not computed when using --dry-run, so we can't do it.
+                # for ease of scripting, we just ignore --quick-stats when given with --dry-run.
+                logger.warning("Ignoring --quick-stats. It is not supported when using --dry-run.")
+                args.quick_stats = False
         if args.show_version:
             logging.getLogger('borg.output.show-version').info('borgbackup version %s' % __version__)
         self.prerun_checks(logger, is_serve)

@@ -199,6 +199,9 @@ This has some notable consequences:
 
 You can manually run compaction by invoking the ``borg compact`` command.
 
+See :ref:`rollback_transaction` for how to undo changes if you have not run
+compaction yet.
+
 .. _append_only_mode:
 
 Append-only mode (forbid compaction)
@@ -231,6 +234,9 @@ Note that you can go back-and-forth between normal and append-only operation wit
 In append-only mode Borg will create a transaction log in the ``transactions`` file,
 where each line is a transaction and a UTC timestamp.
 
+See :ref:`rollback_transaction` for how to use this log to roll back the
+repository to an earlier state.
+
 In addition, ``borg serve`` can act as if a repository is in append-only mode with
 its option ``--append-only``. This can be very useful for fine-tuning access control
 in ``.ssh/authorized_keys``:
@@ -244,11 +250,34 @@ Running ``borg init`` via a ``borg serve --append-only`` server will *not* creat
 an append-only repository. Running ``borg init --append-only`` creates an append-only
 repository regardless of server settings.
 
-Example
-+++++++
+.. _rollback_transaction:
+
+Rolling back a transaction
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Borg repositories are transactional. A command either succeeds completely and
+commits its changes, or it fails (or is interrupted) and the changes are
+not committed.
+
+Furthermore, since Borg 1.2.0, repository space is not freed immediately when
+data is marked as deleted (e.g. when archives are deleted or pruned), because
+compaction is a separate step (see :ref:`separate_compaction`). This means that
+even after a successful commit that deleted data, the old data (and historic
+manifests) might still be present in the repository's segment files.
+
+If you accidentally ran a command that caused data loss (like an incorrect
+``borg recreate`` or ``borg prune``), or if your repository was compromised
+while in append-only mode, you can roll back the repository to a previous state,
+**provided that** ``borg compact`` has not been run since then.
+
+Rollback in append-only mode
+++++++++++++++++++++++++++++
+
+In append-only mode, the repository contains a transaction log that makes it
+easy to identify stable transactions.
 
 Suppose an attacker remotely deleted all backups, but your repository was in append-only
-mode. A transaction log in this situation might look like this:
+mode. A transaction log (the ``transactions`` file) in this situation might look like this:
 
 ::
 
@@ -279,6 +308,41 @@ with file 6::
     rm data/**/{6..13}
 
 That's all to do in the repository.
+
+Manual rollback (Undo)
+++++++++++++++++++++++
+
+If you are not using append-only mode, you can still roll back a transaction
+manually by identifying and removing the latest segment files.
+
+.. note::
+    **Make a backup of the repository directory** (e.g. using ``cp -al``)
+    before doing any manual modifications! Do NOT run ``borg compact``!
+
+1.  **Identify the segment files.**
+    Look into the repository's ``data/`` directory. Segments are numbered and
+    grouped into numbered subdirectories.
+
+2.  **Identify the transaction boundaries.**
+    Each borg operation that modifies the repository creates a transaction,
+    ending with a commit. The last files of a transaction usually are:
+
+    -   **Data segments**: One or more files (up to 500 MB) containing data
+        chunks (PUT tags) or deletion markers (DEL tags).
+    -   **Manifest**: A small file (a few KB) containing the repository manifest.
+    -   **Commit tag**: A tiny file (17 bytes) marking the end of the transaction.
+
+3.  **Find the previous commit.**
+    By looking at the segment files in reverse order (highest numbers first),
+    you can identify the current transaction's commit and manifest, and then
+    the commit of the *previous* transaction (another 17-byte file).
+
+4.  **Remove the files.**
+    Delete (or move away) all segment files that were created **after** the
+    commit of the transaction you want to roll back to.
+
+After the rollback
+++++++++++++++++++
 
 If you want to access this rolled back repository from a client that already has
 a cache for this repository, the cache will reflect a newer repository state
@@ -337,3 +401,30 @@ When running Borg using an automated script, ``ssh`` might still ask for a passw
 even if there is an SSH key for the target server. Use this to make scripts more robust::
 
     export BORG_RSH='ssh -oBatchMode=yes'
+
+.. _adjusting_segment_size:
+
+Adjusting segment size
+~~~~~~~~~~~~~~~~~~~~~~
+
+By default, Borg uses a maximum segment file size of 500 MiB. This is a good
+balance for many use cases, but you can adjust it to better suit your
+environment:
+
+- **Smaller segments (e.g., 50 MiB or 100 MiB)**:
+  Recommended if you use tools like ``rsync`` or ``rclone`` to sync your
+  repository to another location. Smaller segments result in less data being
+  re-transmitted when a segment is updated (e.g., during compaction).
+- **Larger segments**:
+  Usually not necessary, as 500 MiB is already quite large.
+
+You can change this setting for an existing repository:
+
+::
+
+    # Set maximum segment size to 100 MiB (in bytes)
+    borg config /path/to/repo max_segment_size 104857600
+
+Note that changing this setting **only affects new segments** created after the
+change. Already existing segments will only be rewritten to the new size when
+they are picked up by ``borg compact``.

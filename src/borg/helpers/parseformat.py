@@ -212,11 +212,11 @@ def replace_placeholders(text, overrides={}):
         'pid': os.getpid(),
         'fqdn': fqdn,
         'reverse-fqdn': '.'.join(reversed(fqdn.split('.'))),
-        'hostname': hostname,
+        'hostname': os.environ.get('BORG_HOSTNAME') or hostname,
         'now': DatetimeWrapper(current_time.astimezone(None)),
         'utcnow': DatetimeWrapper(current_time),
         'unixtime': int(current_time.timestamp()),
-        'user': getosusername(),
+        'user': os.environ.get('BORG_USERNAME') or getosusername(),
         'uuid4': str(uuid.uuid4()),
         'borgversion': borg_version,
         'borgmajor': '%d' % borg_version_tuple[:1],
@@ -1076,9 +1076,25 @@ def basic_json_data(manifest, *, cache=None, extra=None):
     return data
 
 
+def _json_indent_from_env():
+    """Parse BORG_JSON_INDENT env var for json.dumps indent parameter."""
+    value = os.environ.get("BORG_JSON_INDENT")
+    if value is None:
+        return 4
+    if value.lower() == "none":
+        return None
+    if value == "":
+        return ""
+    try:
+        return int(value)
+    except ValueError:
+        return value
+
+
 def json_dump(obj):
     """Dump using BorgJSONEncoder."""
-    return json.dumps(obj, sort_keys=True, indent=4, cls=BorgJsonEncoder)
+    indent = _json_indent_from_env()
+    return json.dumps(obj, sort_keys=True, indent=indent, cls=BorgJsonEncoder)
 
 
 def json_print(obj):

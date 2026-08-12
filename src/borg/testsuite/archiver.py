@@ -459,6 +459,37 @@ class ArchiverTestCase(ArchiverTestCaseBase):
         # the interesting parts of info_output2 and info_output should be same
         self.assert_equal(filter(info_output), filter(info_output2))
 
+    def test_create_quick_stats(self):
+        self.create_regular_file('file1', size=1024)
+        self.cmd('init', '--encryption=none', self.repository_location)
+        output = self.cmd('create', '--quick-stats', self.repository_location + '::test', 'input')
+        self.assert_in('Archive name: test', output)
+        self.assert_in('This archive:', output)
+        assert 'All archives:' not in output
+        assert 'Chunk index:' not in output
+
+    def test_create_quick_stats_json(self):
+        self.create_regular_file('file1', size=1024)
+        self.cmd('init', '--encryption=none', self.repository_location)
+        create_json = json.loads(self.cmd('create', '--json', '--quick-stats',
+                                          self.repository_location + '::test', 'input'))
+        assert 'archive' in create_json
+        assert 'stats' in create_json['archive']
+        assert 'cache' not in create_json
+
+    def test_create_stats_and_quick_stats_are_mutually_exclusive(self):
+        output = self.cmd('create', '--stats', '--quick-stats',
+                          self.repository_location + '::test', 'input', exit_code=2)
+        self.assert_in('--stats and --quick-stats are mutually exclusive', output)
+
+    def test_create_dry_run_ignores_quick_stats(self):
+        self.create_regular_file('file1', size=1024)
+        self.cmd('init', '--encryption=none', self.repository_location)
+        output = self.cmd('create', '--dry-run', '--quick-stats',
+                          self.repository_location + '::test', 'input')
+        self.assert_in('Ignoring --quick-stats', output)
+        assert 'This archive:' not in output
+
     @requires_hardlinks
     def test_create_duplicate_root(self):
         # setup for #5603
@@ -523,6 +554,124 @@ class ArchiverTestCase(ArchiverTestCaseBase):
         with changedir('output'):
             self.cmd('extract', self.repository_location + '::test')
             assert os.readlink('input/link1') == 'somewhere'
+
+    def _create_malicious_archive(self, name, items):
+        # Inject raw Items directly into an archive, bypassing "borg create" (which would never
+        # produce a child below a symlink or a path with embedded "..").
+        repository = Repository(self.repository_path, exclusive=True)
+        with repository:
+            manifest, key = Manifest.load(repository, Manifest.NO_OPERATION_CHECK)
+            with Cache(repository, key, manifest) as cache:
+                archive = Archive(repository, key, manifest, name, cache=cache, create=True)
+                for item in items:
+                    archive.items_buffer.add(item)
+                archive.save()
+
+    def test_extract_through_symlinked_parent(self):
+        # Security: an archive with a symlink "evil" -> "/etc", followed by a regular file
+        # "evil/passwd", must NOT overwrite/delete files in the symlink target directory.
+        if self.prefix:
+            pytest.skip('malicious archive is crafted via direct (local) repository access')
+        self.cmd('init', '--encryption=repokey', self.repository_location)
+        victim_dir = os.path.join(self.tmpdir, 'victim')
+        os.mkdir(victim_dir)
+        victim_file = os.path.join(victim_dir, 'passwd')
+        with open(victim_file, 'w') as fd:
+            fd.write('original')
+        attrs = dict(mtime=0, uid=0, gid=0, user='root', group='root')
+        self._create_malicious_archive('evil', [
+            Item(path='evil', mode=stat.S_IFLNK | 0o777, source=victim_dir, **attrs),
+            Item(path='evil/passwd', mode=stat.S_IFREG | 0o644, chunks=[], **attrs),
+        ])
+        with changedir('output'):
+            output = self.cmd('extract', self.repository_location + '::evil', exit_code=EXIT_WARNING)
+        assert 'parent directory is a symlink' in output
+        # the out-of-tree victim must be untouched (neither deleted nor overwritten)
+        assert os.path.exists(victim_file)
+        with open(victim_file) as fd:
+            assert fd.read() == 'original'
+        # the symlink item itself was restored faithfully
+        assert os.path.islink(os.path.join(self.output_path, 'evil'))
+
+    def test_extract_path_with_embedded_dotdot(self):
+        # Security: a regular file with an embedded ".." (e.g. a/../../victim/passwd) must not
+        # be extracted outside the destination directory.
+        if self.prefix:
+            pytest.skip('malicious archive is crafted via direct (local) repository access')
+        self.cmd('init', '--encryption=repokey', self.repository_location)
+        victim_dir = os.path.join(self.tmpdir, 'victim')
+        os.mkdir(victim_dir)
+        victim_file = os.path.join(victim_dir, 'passwd')
+        with open(victim_file, 'w') as fd:
+            fd.write('original')
+        attrs = dict(mtime=0, uid=0, gid=0, user='root', group='root')
+        # from inside the output dir, "a/../../victim/passwd" resolves to <tmpdir>/victim/passwd
+        self._create_malicious_archive('evil', [
+            Item(path='a/../../victim/passwd', mode=stat.S_IFREG | 0o644, chunks=[], **attrs),
+        ])
+        with changedir('output'):
+            output = self.cmd('extract', self.repository_location + '::evil', exit_code=EXIT_WARNING)
+        assert 'path contains "../"' in output
+        assert os.path.exists(victim_file)
+        with open(victim_file) as fd:
+            assert fd.read() == 'original'
+
+    def test_extract_hardlink_through_symlinked_source(self):
+        # Security: a hardlink whose source traverses a symlink (here "evil" -> victim dir,
+        # source "evil/secret") must NOT link an external file into the extracted tree.
+        if self.prefix:
+            pytest.skip('malicious archive is crafted via direct (local) repository access')
+        self.cmd('init', '--encryption=repokey', self.repository_location)
+        victim_dir = os.path.join(self.tmpdir, 'victim')
+        os.mkdir(victim_dir)
+        secret = os.path.join(victim_dir, 'secret')
+        with open(secret, 'w') as fd:
+            fd.write('secret')
+        attrs = dict(mtime=0, uid=0, gid=0, user='root', group='root')
+        self._create_malicious_archive('evil', [
+            Item(path='evil', mode=stat.S_IFLNK | 0o777, source=victim_dir, **attrs),
+            Item(path='pwned', mode=stat.S_IFREG | 0o644, source='evil/secret', **attrs),
+        ])
+        with changedir('output'):
+            output = self.cmd('extract', self.repository_location + '::evil', exit_code=EXIT_WARNING)
+        assert 'hardlink source path is unsafe' in output
+        # no hardlink to the external file was created
+        assert not os.path.exists(os.path.join(self.output_path, 'pwned'))
+        with open(secret) as fd:
+            assert fd.read() == 'secret'
+
+    def test_extract_hardlink_source_with_embedded_dotdot(self):
+        # Security: a hardlink whose source contains ".." must not be linked.
+        if self.prefix:
+            pytest.skip('malicious archive is crafted via direct (local) repository access')
+        self.cmd('init', '--encryption=repokey', self.repository_location)
+        victim_dir = os.path.join(self.tmpdir, 'victim')
+        os.mkdir(victim_dir)
+        secret = os.path.join(victim_dir, 'secret')
+        with open(secret, 'w') as fd:
+            fd.write('secret')
+        attrs = dict(mtime=0, uid=0, gid=0, user='root', group='root')
+        self._create_malicious_archive('evil', [
+            Item(path='pwned', mode=stat.S_IFREG | 0o644, source='a/../../victim/secret', **attrs),
+        ])
+        with changedir('output'):
+            output = self.cmd('extract', self.repository_location + '::evil', exit_code=EXIT_WARNING)
+        assert 'hardlink source path is unsafe' in output
+        assert not os.path.exists(os.path.join(self.output_path, 'pwned'))
+
+    def test_extract_deep_tree_ok(self):
+        # The parent-path guard (and its safe_dirs cache) must not break normal extraction of a
+        # deep tree where many files share the same parent directories.
+        self.cmd('init', '--encryption=repokey', self.repository_location)
+        self.create_regular_file('d1/d2/d3/file1', size=10)
+        self.create_regular_file('d1/d2/d3/file2', size=10)
+        self.create_regular_file('d1/d2/other', size=10)
+        self.cmd('create', self.repository_location + '::test', 'input')
+        with changedir('output'):
+            self.cmd('extract', self.repository_location + '::test')
+            assert os.path.exists('input/d1/d2/d3/file1')
+            assert os.path.exists('input/d1/d2/d3/file2')
+            assert os.path.exists('input/d1/d2/other')
 
     @pytest.mark.skipif(not is_utime_fully_supported(), reason='cannot properly setup and execute test without utime')
     def test_directory_timestamps1(self):
@@ -1760,6 +1909,28 @@ class ArchiverTestCase(ArchiverTestCaseBase):
         with Repository(self.repository_path) as repository:
             self.assert_equal(len(repository), 1)
 
+    def test_delete_quick_stats(self):
+        self.cmd('init', '--encryption=none', self.repository_location)
+        self.cmd('create', self.repository_location + '::test1', src_dir)
+        self.cmd('create', self.repository_location + '::test2', src_dir)
+        output = self.cmd('delete', '--quick-stats', self.repository_location + '::test1')
+        self.assert_in('Deleted data:', output)
+        assert 'All archives:' not in output
+        assert 'Chunk index:' not in output
+
+    def test_delete_stats_and_quick_stats_are_mutually_exclusive(self):
+        output = self.cmd('delete', '--stats', '--quick-stats',
+                          self.repository_location + '::test', exit_code=2)
+        self.assert_in('--stats and --quick-stats are mutually exclusive', output)
+
+    def test_delete_dry_run_ignores_quick_stats(self):
+        self.cmd('init', '--encryption=none', self.repository_location)
+        self.cmd('create', self.repository_location + '::test1', src_dir)
+        self.cmd('create', self.repository_location + '::test2', src_dir)
+        output = self.cmd('delete', '--dry-run', '--quick-stats', self.repository_location + '::test1')
+        self.assert_in('Ignoring --quick-stats', output)
+        assert 'Deleted data:' not in output
+
     def test_delete_multiple(self):
         self.create_regular_file('file1', size=1024 * 80)
         self.cmd('init', '--encryption=repokey', self.repository_location)
@@ -2160,6 +2331,27 @@ class ArchiverTestCase(ArchiverTestCaseBase):
         if has_lchflags:
             self.assert_in("x input/file3", output)
 
+    def test_create_exclude_dataless(self):
+        """test that files flagged SF_DATALESS are excluded with --exclude-dataless"""
+        from ..archiver import SF_DATALESS
+
+        self.create_regular_file('file1', size=1024 * 80)
+        self.create_regular_file('cloudfile', size=1024 * 80)
+
+        # SF_DATALESS cannot be set from userspace, so fake the flags lookup.
+        def fake_get_flags(path, st, fd=None):
+            return SF_DATALESS if path.endswith('cloudfile') else 0
+
+        self.cmd('init', '--encryption=repokey', self.repository_location)
+        with patch('borg.archiver.get_flags', fake_get_flags):
+            output = self.cmd('create', '--list', '--exclude-dataless', self.repository_location + '::test', 'input')
+        self.assert_in('A input/file1', output)
+        self.assert_in('x input/cloudfile', output)
+        # without --exclude-dataless, the file is backed up
+        with patch('borg.archiver.get_flags', fake_get_flags):
+            output = self.cmd('create', '--list', self.repository_location + '::test2', 'input')
+        self.assert_in('A input/cloudfile', output)
+
     def test_create_json(self):
         self.create_regular_file('file1', size=1024 * 80)
         self.cmd('init', '--encryption=repokey', self.repository_location)
@@ -2176,6 +2368,18 @@ class ArchiverTestCase(ArchiverTestCaseBase):
         assert isinstance(archive['duration'], float)
         assert len(archive['id']) == 64
         assert 'stats' in archive
+
+    def test_create_hostname_username_override(self):
+        self.cmd('init', '--encryption=repokey', self.repository_location)
+        self.create_regular_file('file1', size=1024 * 80)
+        with environment_variable(BORG_HOSTNAME='foo_host', BORG_USERNAME='bar_user'):
+            # the override is also used to fill the {hostname}/{user} placeholders in the archive name:
+            self.cmd('create', self.repository_location + '::{hostname}-{user}', 'input')
+        info = json.loads(self.cmd('info', '--json', self.repository_location + '::foo_host-bar_user'))
+        archive = info['archives'][0]
+        assert archive['name'] == 'foo_host-bar_user'
+        assert archive['hostname'] == 'foo_host'
+        assert archive['username'] == 'bar_user'
 
     def test_create_topical(self):
         self.create_regular_file('file1', size=1024 * 80)
@@ -2265,6 +2469,24 @@ class ArchiverTestCase(ArchiverTestCaseBase):
         assert 'secondA/thirdA' in output
         assert 'secondB' in output
         assert 'secondB/thirdB' in output
+
+    def test_create_dotslash_hack_root_metadata(self):
+        """Test that the slashdot hack archives the source directory metadata as the archive root."""
+        os.makedirs(os.path.join(self.input_path, "first", "subdir"))
+        self.create_regular_file("first/file1", contents=b"hello")
+        self.cmd('init', '--encryption=none', self.repository_location)
+        archive = self.repository_location + '::test'
+        self.cmd('create', archive, 'input/first/./')  # slashdot hack
+        output = self.cmd('list', archive)
+        # the root directory "." must be in the archive (this was the bug in #9534).
+        lines = output.splitlines()
+        assert lines[0].endswith(" .")
+        # children of the slashdot target must be archived.
+        assert "subdir" in output
+        assert "file1" in output
+        # parent directories must NOT be in the archive.
+        assert "input" not in output
+        assert "first" not in output
 
     # def test_cmdline_compatibility(self):
     #    self.create_regular_file('file1', size=1024 * 80)
@@ -2490,6 +2712,28 @@ class ArchiverTestCase(ArchiverTestCaseBase):
         output = self.cmd('list', self.repository_location)
         self.assert_not_in('test1', output)
         self.assert_in('test2', output)
+
+    def test_prune_quick_stats(self):
+        self.cmd('init', '--encryption=none', self.repository_location)
+        self.cmd('create', self.repository_location + '::test1', src_dir)
+        self.cmd('create', self.repository_location + '::test2', src_dir)
+        output = self.cmd('prune', '--quick-stats', '--keep-daily=1', self.repository_location)
+        self.assert_in('Deleted data:', output)
+        assert 'All archives:' not in output
+        assert 'Chunk index:' not in output
+
+    def test_prune_stats_and_quick_stats_are_mutually_exclusive(self):
+        output = self.cmd('prune', '--stats', '--quick-stats', '--keep-daily=1',
+                          self.repository_location, exit_code=2)
+        self.assert_in('--stats and --quick-stats are mutually exclusive', output)
+
+    def test_prune_dry_run_ignores_quick_stats(self):
+        self.cmd('init', '--encryption=none', self.repository_location)
+        self.cmd('create', self.repository_location + '::test1', src_dir)
+        self.cmd('create', self.repository_location + '::test2', src_dir)
+        output = self.cmd('prune', '--dry-run', '--quick-stats', '--keep-daily=1', self.repository_location)
+        self.assert_in('Ignoring --quick-stats', output)
+        assert 'Deleted data:' not in output
 
     def test_prune_repository_prefix(self):
         self.cmd('init', '--encryption=repokey', self.repository_location)
@@ -3160,7 +3404,7 @@ class ArchiverTestCase(ArchiverTestCaseBase):
         assert "is invalid" in output
 
     def test_init_interrupt(self):
-        def raise_eof(*args):
+        def raise_eof(*args, **kwargs):
             raise EOFError
 
         with patch.object(KeyfileKeyBase, 'create', raise_eof):
@@ -3597,7 +3841,7 @@ class ArchiverTestCase(ArchiverTestCaseBase):
             repo_key2 = RepoKey(repository)
             repo_key2.load(None, Passphrase.env_passphrase())
 
-        assert repo_key2.enc_key == repo_key2.enc_key
+        assert repo_key2.enc_key == repo_key.enc_key
 
     def test_key_export_qr(self):
         export_file = self.output_path + '/exported.html'
@@ -3914,6 +4158,28 @@ id: 2 / e29442 3506da 4e1ea7 / 25f62a 5a3d41 - 02
             self.cmd('extract', self.repository_location + '::dst')
         self.assert_dirs_equal('input', 'output/input', ignore_ns=True, ignore_xattrs=True)
 
+    def test_import_tar_quick_stats(self):
+        self.create_regular_file('file1', size=1024)
+        self.cmd('init', '--encryption=none', self.repository_location)
+        self.cmd('create', self.repository_location + '::src', 'input')
+        self.cmd('export-tar', self.repository_location + '::src', 'simple.tar')
+        output = self.cmd('import-tar', '--quick-stats', self.repository_location + '::dst', 'simple.tar')
+        self.assert_in('Archive name: dst', output)
+        self.assert_in('This archive:', output)
+        assert 'All archives:' not in output
+        assert 'Chunk index:' not in output
+
+    def test_import_tar_quick_stats_json(self):
+        self.create_regular_file('file1', size=1024)
+        self.cmd('init', '--encryption=none', self.repository_location)
+        self.cmd('create', self.repository_location + '::src', 'input')
+        self.cmd('export-tar', self.repository_location + '::src', 'simple.tar')
+        import_json = json.loads(self.cmd('import-tar', '--json', '--quick-stats',
+                                          self.repository_location + '::dst', 'simple.tar'))
+        assert 'archive' in import_json
+        assert 'stats' in import_json['archive']
+        assert 'cache' not in import_json
+
     @requires_gzip
     def test_import_tar_gz(self):
         if not shutil.which('gzip'):
@@ -4146,6 +4412,79 @@ id: 2 / e29442 3506da 4e1ea7 / 25f62a 5a3d41 - 02
         self.cmd('recreate', '--chunker-params=10,12,11,63', self.repository_location + '::archive')
         assert original_size('archive') == sum(sizes)
 
+    def test_related_repos_deduplication(self):
+        CHUNKER_PARAMS = 'buzhash,10,18,14,4095'  # ~16kiB chunks
+        # 1. Create repo1
+        self.cmd('init', '--encryption=repokey', self.repository_location)
+        # use a rather large file so buzhash reliably produces many chunks (~64 on average).
+        # this avoids flaky failures of the "len(ids1) > 3" check below: with a smaller file,
+        # the geometric chunk-length distribution of random data occasionally yields very few chunks.
+        self.create_regular_file('file1', contents=os.urandom(1024 * 1024))
+        self.cmd('create', f'--chunker-params={CHUNKER_PARAMS}', self.repository_location + '::archive1', 'input')
+
+        # 2. Export related secrets
+        secrets_path = os.path.join(self.tmpdir, 'secrets.json')
+        self.cmd('key', 'export-related-secrets', self.repository_location, secrets_path)
+
+        with open(secrets_path, 'r') as f:
+            secrets = json.load(f)
+        assert secrets['version'] == 1
+        assert 'id_key' in secrets
+        assert 'chunk_seed' in secrets
+        assert 'key_name' in secrets
+
+        # 3. Create repo2 using imported secrets
+        repo2_path = os.path.join(self.tmpdir, 'repo2')
+        repo2_location = self.prefix + repo2_path
+        self.cmd('init', '--encryption=repokey', '--import-related-secrets', secrets_path, repo2_location)
+
+        # 4. Create backup in repo2 with same data
+        self.cmd('create', f'--chunker-params={CHUNKER_PARAMS}', repo2_location + '::archive2', 'input')
+
+        # 5. Verify chunk IDs are identical
+        def get_chunk_ids(repo_path, archive_name):
+            with Repository(repo_path) as repository:
+                manifest, key = Manifest.load(repository, Manifest.NO_OPERATION_CHECK)
+                archive = Archive(repository, key, manifest, archive_name)
+                ids = []
+                for item in archive.iter_items():
+                    chunks = getattr(item, 'chunks', None)
+                    if chunks:
+                        ids.extend(c.id for c in chunks)
+                return ids
+
+        ids1 = get_chunk_ids(self.repository_path, 'archive1')
+        ids2 = get_chunk_ids(repo2_path, 'archive2')
+
+        assert ids1 == ids2
+        assert len(ids1) > 3
+
+        # 6. Verify encryption keys are different, but id_key and chunk_seed are same
+        def get_keys(repo_path):
+            with Repository(repo_path) as repository:
+                manifest, key = Manifest.load(repository, Manifest.NO_OPERATION_CHECK)
+                return key.enc_key, key.enc_hmac_key, key.id_key, key.chunk_seed
+
+        enc_key1, hmac_key1, id_key1, chunk_seed1 = get_keys(self.repository_path)
+        enc_key2, hmac_key2, id_key2, chunk_seed2 = get_keys(repo2_path)
+
+        assert enc_key1 != enc_key2
+        assert hmac_key1 != hmac_key2
+        assert id_key1 == id_key2
+        assert chunk_seed1 == chunk_seed2
+
+    def test_related_repos_incompatible_key_name(self):
+        # Create repo1 with default (HMAC-SHA256)
+        self.cmd('init', '--encryption=repokey', self.repository_location)
+        secrets_path = os.path.join(self.tmpdir, 'secrets.json')
+        self.cmd('key', 'export-related-secrets', self.repository_location, secrets_path)
+ 
+        # Try to create repo2 with BLAKE2b (incompatible)
+        repo2_path = os.path.join(self.tmpdir, 'repo2')
+        repo2_location = self.prefix + repo2_path
+        # This should fail
+        out = self.cmd('init', '--encryption=repokey-blake2', '--import-related-secrets', secrets_path, repo2_location, exit_code=2, fork=True)
+        assert 'deduplication will break' in out
 
 @unittest.skipUnless('binary' in BORG_EXES, 'no borg.exe available')
 class ArchiverTestCaseBinary(ArchiverTestCase):
@@ -4166,6 +4505,10 @@ class ArchiverTestCaseBinary(ArchiverTestCase):
 
     @unittest.skip('patches objects')
     def test_extract_xattrs_errors(self):
+        pass
+
+    @unittest.skip('patches objects')
+    def test_create_exclude_dataless(self):
         pass
 
     @unittest.skip('test_basic_functionality seems incompatible with fakeroot and/or the binary.')
@@ -4205,8 +4548,6 @@ class ArchiverCheckTestCase(ArchiverTestCaseBase):
         self.assert_in('Starting repository check', output)
         self.assert_in('Starting archive consistency check', output)
         self.assert_in('Checking segments', output)
-        # reset logging to new process default to avoid need for fork=True on next check
-        logging.getLogger('borg.output.progress').setLevel(logging.NOTSET)
         output = self.cmd('check', '-v', '--repository-only', self.repository_location, exit_code=0)
         self.assert_in('Starting repository check', output)
         self.assert_not_in('Starting archive consistency check', output)

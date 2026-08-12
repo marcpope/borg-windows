@@ -1,6 +1,7 @@
 import errno
 import json
 import os
+import re
 import socket
 import stat
 import sys
@@ -27,6 +28,7 @@ from .compress import Compressor, CompressionSpec
 from .constants import *  # NOQA
 from .crypto.low_level import IntegrityError as IntegrityErrorBase
 from .helpers import BackupError, BackupRaceConditionError
+from .helpers import BackupSymlinkParentError, BackupPathTraversalError, BackupHardlinkSourceError
 from .helpers import BackupOSError, BackupPermissionError, BackupFileNotFoundError, BackupIOError
 from .hashindex import ChunkIndex, ChunkIndexEntry, CacheSynchronizer
 from .helpers import Manifest
@@ -441,6 +443,9 @@ class Archive:
         self.cache = cache
         self.manifest = manifest
         self.hard_links = {}
+        # cache of parent directory paths verified (during extraction) to be real
+        # directories and not symlinks, so we do not have to lstat them again and again.
+        self.safe_dirs = set()
         self.stats = Statistics(output_json=log_json, iec=iec)
         self.iec = iec
         self.show_progress = progress
@@ -632,8 +637,8 @@ Utilization of max. archive size: {csize_max:.0%}
             'comment': comment or '',
             'items': self.items_buffer.chunks,
             'cmdline': sys.argv,
-            'hostname': hostname,
-            'username': getuser(),
+            'hostname': os.environ.get('BORG_HOSTNAME') or hostname,
+            'username': os.environ.get('BORG_USERNAME') or getuser(),
             'time': start.strftime(ISO_FORMAT),
             'time_end': end.strftime(ISO_FORMAT),
             'cwd': self.cwd,
@@ -738,17 +743,80 @@ Utilization of max. archive size: {csize_max:.0%}
                 stats.csize = self.metadata.csize
         return stats
 
+    def _check_safe_parent(self, archived_path):
+        """Refuse *archived_path* if its parent directory chain is not safe for extraction.
+
+        *archived_path* is a path as stored in the archive, relative to self.cwd. Archived
+        paths always use "/" separators (see make_path_safe), on POSIX (os.sep == "/") as
+        well as on Windows. borg create never produces a path containing ".." or a path below
+        a symlinked directory, so such a path can only come from a malicious or corrupted
+        archive and could be used to access a location outside the extraction directory.
+
+        Raises BackupPathTraversalError if a parent component is "..", or
+        BackupSymlinkParentError if an existing parent component is a symlink (or other
+        non-directory). Directories verified to be safe are cached in self.safe_dirs, so each
+        directory is only lstat'ed once per extraction.
+        """
+        if is_win32:
+            # Windows also treats "\" as a path separator and ":" can address another drive
+            # ("C:evil") or an NTFS alternate data stream ("file:stream"). borg create never
+            # stores either (make_path_safe strips them), so refuse instead of letting a
+            # crafted component slip past the component checks below.
+            if archived_path.startswith(('/', '\\')) or ':' in archived_path:
+                raise BackupPathTraversalError(archived_path)
+            components = re.split(r'[/\\]', archived_path)
+        else:
+            components = archived_path.split(os.sep)
+        parent_components = [c for c in components[:-1] if c not in ('', '.')]
+        # Reject ".." up front: this keeps the lstat walk below from climbing above self.cwd,
+        # and makes the early "break" on a not-yet-existing component safe (it can not skip a
+        # later "..").
+        if '..' in parent_components:
+            raise BackupPathTraversalError(archived_path)
+        # Every *existing* parent directory component must be a real directory, not a symlink.
+        current = self.cwd
+        for component in parent_components:
+            current = os.path.join(current, component)
+            if current in self.safe_dirs:
+                continue
+            try:
+                st = os.lstat(current)
+            except FileNotFoundError:
+                # parent does not exist yet, it will be created (as a real directory) below an
+                # already-verified-safe chain.
+                break
+            if not stat.S_ISDIR(st.st_mode):
+                # os.lstat does not follow symlinks, so a symlinked parent shows up here as a
+                # non-directory. Refuse to follow it out of the extraction directory.
+                raise BackupSymlinkParentError(archived_path)
+            self.safe_dirs.add(current)  # verified real directory, skip re-stat for later items
+
     @contextmanager
     def extract_helper(self, dest, item, path, stripped_components, original_path, hardlink_masters):
         hardlink_set = False
         # Hard link?
         if 'source' in item:
-            source = os.path.join(dest, *item.source.split('/')[stripped_components:])
+            # item.source is attacker-controlled and used as the hardlink target below. Refuse
+            # to follow a symlinked parent or ".." out of the extraction directory - otherwise a
+            # crafted archive could os.link() an arbitrary external file (e.g. /etc/shadow) into
+            # the extracted tree. Archived paths always use "/" separators (see make_path_safe),
+            # on Windows as well as on POSIX (where os.sep == "/").
+            source_components = item.source.split('/')[stripped_components:]
+            try:
+                self._check_safe_parent('/'.join(source_components))
+            except BackupError:
+                raise BackupHardlinkSourceError(item.path) from None
+            source = os.path.join(dest, *source_components)
             chunks, link_target = hardlink_masters.get(item.source, (None, source))
             if link_target and has_link:
-                # Hard link was extracted previously, just link
+                # Hard link was extracted previously, just link.
+                # follow_symlinks=False: if the final source component is a symlink, link the
+                # symlink itself (a faithful restore) rather than the external file it targets.
                 with backup_io('link'):
-                    os.link(link_target, path)
+                    if os.link in os.supports_follow_symlinks:
+                        os.link(link_target, path, follow_symlinks=False)
+                    else:
+                        os.link(link_target, path)
                     hardlink_set = True
             elif chunks is not None:
                 # assign chunks to this item, since the item which had the chunks was not extracted
@@ -805,7 +873,17 @@ Utilization of max. archive size: {csize_max:.0%}
         dest = self.cwd
         if item.path.startswith(('/', '../')):
             raise Exception('Path should be relative and local')
-        path = os.path.join(dest, item.path)
+        # Join per component: archived paths always use "/" (see make_path_safe), and this
+        # keeps every spelling of *path* (including the self.safe_dirs keys derived from it)
+        # consistently os.sep-separated on Windows. On POSIX this is identical to
+        # os.path.join(dest, item.path).
+        path = os.path.join(dest, *item.path.split('/'))
+        # Refuse to extract items whose parent directory path is not safe (a symlinked parent or
+        # a path containing ".."). Without this check, the "remove existing file" block and the
+        # open()/mkdir()/symlink() calls below would follow such a parent path and could delete or
+        # overwrite files outside the extraction directory (e.g. /etc/passwd).
+        self.safe_dirs.discard(path)  # path is about to be (re)created; never trust a stale entry for it
+        self._check_safe_parent(item.path)
         # Attempt to remove existing files, ignore errors on failure
         try:
             st = os.stat(path, follow_symlinks=False)
@@ -820,8 +898,15 @@ Utilization of max. archive size: {csize_max:.0%}
 
         def make_parent(path):
             parent_dir = os.path.dirname(path)
+            if parent_dir in self.safe_dirs:
+                # the parent path guard above already verified (this extraction) that parent_dir
+                # exists and is a real directory, so there is nothing to do and no need to stat it.
+                return
             if not os.path.exists(parent_dir):
                 os.makedirs(parent_dir)
+            # remember parent_dir as a real directory (it either existed - e.g. dest - or we just
+            # created it below an already-verified-safe chain), so later items can skip the stat.
+            self.safe_dirs.add(parent_dir)
 
         mode = item.mode
         if stat.S_ISREG(mode):
@@ -1035,22 +1120,35 @@ Utilization of max. archive size: {csize_max:.0%}
                 data = self.key.decrypt(items_id, data)
                 unpacker.feed(data)
                 chunk_decref(items_id, stats)
-                try:
-                    for item in unpacker:
+                while True:
+                    try:
+                        item = next(unpacker)
+                    except StopIteration:
+                        # no more (complete) items in the buffer, feed the next chunk
+                        break
+                    except msgpack.UnpackException:
+                        # items metadata corrupted. the unpacker can't be reused after an
+                        # unpacking failure, so create a fresh one and skip the rest of this chunk.
+                        if forced == 0:
+                            raise
+                        error = True
+                        unpacker = msgpack.Unpacker(use_list=False)
+                        break
+                    try:
                         item = Item(internal_dict=item)
                         if 'chunks' in item:
                             part = not self.consider_part_files and 'part' in item
                             for chunk_id, size, csize in item.chunks:
                                 chunk_decref(chunk_id, stats, part=part)
-                except (TypeError, ValueError):
-                    # if items metadata spans multiple chunks and one chunk got dropped somehow,
-                    # it could be that unpacker yields bad types
-                    if forced == 0:
-                        raise
-                    error = True
+                    except (TypeError, ValueError):
+                        # if items metadata spans multiple chunks and one chunk got dropped somehow,
+                        # it could be that unpacker yields bad types
+                        if forced == 0:
+                            raise
+                        error = True
             if progress:
                 pi.finish()
-        except (msgpack.UnpackException, Repository.ObjectNotFound):
+        except Repository.ObjectNotFound:
             # items metadata corrupted
             if forced == 0:
                 raise
@@ -1353,12 +1451,16 @@ class FilesystemObjectProcessors:
     def create_helper(self, path, st, status=None, hardlinkable=True, strip_prefix=None):
         if strip_prefix is not None:
             assert not path.endswith(os.sep)
-            if strip_prefix.startswith(path + os.sep):
+            if path + os.sep == strip_prefix:
+                # this is the directory the slashdot hack points to - archive it as the root.
+                path = "."
+            elif strip_prefix.startswith(path + os.sep):
                 # still on a directory level that shall be stripped - do not create an item for this!
                 yield None, 'x', False, False
                 return
-            # adjust path, remove stripped directory levels
-            path = path.removeprefix(strip_prefix)
+            else:
+                # adjust path, remove stripped directory levels
+                path = path.removeprefix(strip_prefix)
 
         safe_path = make_path_safe(path)
         item = Item(path=safe_path)
@@ -1505,8 +1607,16 @@ class FilesystemObjectProcessors:
                     if chunks is not None:
                         item.chunks = chunks
                     else:
-                        with backup_io('read'):
-                            self.process_file_chunks(item, cache, self.stats, self.show_progress, backup_io_iter(self.chunker.chunkify(None, fd)))
+                        # Do NOT wrap this in backup_io('read'): the source-file reads are already
+                        # guarded individually by backup_io_iter() below. Wrapping the whole call would
+                        # also wrap add_chunk()'s (and maybe_checkpoint()'s) *repository* writes, so a
+                        # repository IO failure (e.g. the repo running out of space) would be misreported
+                        # as a per-file "read" error and only warned about (then the file skipped),
+                        # instead of aborting. An unwrapped repository OSError is critical (see the
+                        # BackupOSError docstring). In 1.4 the transactional repository still rolls the
+                        # partial transaction back, so this is not data loss here, but the misclassified
+                        # warning and pointless read-retries are wrong regardless.
+                        self.process_file_chunks(item, cache, self.stats, self.show_progress, backup_io_iter(self.chunker.chunkify(None, fd)))
                         if is_win32:
                             changed_while_backup = False  # TODO
                         else:

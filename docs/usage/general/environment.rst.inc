@@ -34,7 +34,7 @@ General:
         When set, use the value to answer the passphrase question when a **new** passphrase is asked for.
         This variable is checked first. If it is not set, BORG_PASSPHRASE and BORG_PASSCOMMAND will also
         be checked.
-        Main usecase for this is to fully automate ``borg change-passphrase``.
+        Main usecase for this is to fully automate ``borg key change-passphrase``.
     BORG_DISPLAY_PASSPHRASE
         When set, use the value to answer the "display the passphrase for verification" question when defining a new passphrase for encrypted repositories.
     BORG_EXIT_CODES
@@ -47,6 +47,14 @@ General:
         So, if you have a all-zero MAC address or other reasons to better externally control the host id, just set this
         environment variable to a unique value. If all your FQDNs are unique, you can just use the FQDN. If not,
         use fqdn@uniqueid.
+    BORG_HOSTNAME
+        When set, use this value as the hostname (instead of the auto-detected one), e.g. to run borg
+        on one host, but impersonate another host (see #9651). This affects the hostname stored in newly
+        created archives as well as the ``{hostname}`` placeholder.
+    BORG_USERNAME
+        When set, use this value as the username (instead of the auto-detected one), e.g. to run borg
+        as one user, but impersonate another user. This affects the username stored in newly created
+        archives as well as the ``{user}`` placeholder.
     BORG_LOGGING_CONF
         When set, use the given filename as INI_-style logging configuration.
         A basic example conf can be found at ``docs/misc/logging.conf``.
