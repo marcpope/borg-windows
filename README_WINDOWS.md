@@ -31,6 +31,14 @@ This fork adds the ability to compile and run Borg natively on Windows (not thro
 - **`CTRL_BREAK_EVENT` handling**: borg on Windows now installs a `SIGBREAK` handler that raises `SigTerm`, so a parent supervisor (e.g. BBS agent) cancelling borg via `CTRL_BREAK_EVENT` flows through the normal orderly-exit path instead of skipping finalizers.
 - **Safer `RemoteRepository.close()` teardown**: closes stdin first, drains+joins the Windows reader threads, bounded `p.wait(timeout=30)` with `kill()` fallback, then closes stdout/stderr. This prevents an abortive pipe shutdown from racing the server's commit and leaving the server-side lock behind.
 
+### Upstream 1.4.5 merge (v1.4.5-win1)
+
+- Rebased the fork onto upstream [BorgBackup 1.4.5](https://github.com/borgbackup/borg/blob/1.4-maint/docs/changes.rst) (merge of tag `1.4.5`). Upstream highlights:
+  - **Security (extract)**: refuse unsafe parent paths (symlinked directory or embedded `..`) and unsafe hardlink source paths during extraction. On this fork the checks are additionally enforced against Windows-specific path tricks: `\` is treated as a separator like `/`, and components containing `:` (drive letters, NTFS alternate data streams) are refused — `borg create` never produces such paths, so they can only come from a malicious or corrupted archive. **Note:** archives created with the very old v1.4.4-win1/-win2 releases (before path normalization existed) store raw `C:\...` paths and will now refuse to extract *on Windows* with a path-traversal error; extract those with an older release (or on POSIX) if you still have any.
+  - msgpack 1.2.x is now supported.
+  - `create --exclude-dataless` to skip cloud files not materialized locally (useful with OneDrive/iCloud placeholders).
+  - `prune --quick-stats` / `delete --quick-stats`, `BORG_JSON_INDENT`, `BORG_HOSTNAME`/`BORG_USERNAME` overrides, "related repositories", plus assorted fixes.
+
 ### Local repo + connection-error fixes (v1.4.4-win7)
 
 - **Local drive-letter repositories** ([#7](https://github.com/marcpope/borg-windows/issues/7)): a repository given as a drive-letter path (`C:\repo`, `C:/repo`) was misparsed as an scp-style SSH target (host `C`) and hung trying to connect. `Location._parse` now recognizes drive-letter (and UNC) paths as local before the SSH/scp interpretation. `ssh://` and `user@host:path` remotes are unchanged.
@@ -46,6 +54,7 @@ This fork adds the ability to compile and run Borg natively on Windows (not thro
 | `src/borg/remote.py` | Windows SSH fixes + Job Object assignment + safer `close()` teardown + `EINVAL`/`EBADF` broken-pipe handling |
 | `src/borg/helpers/parseformat.py` | `Location._parse` recognizes drive-letter/UNC local repo paths before scp/SSH |
 | `src/borg/archiver.py` | `SIGBREAK` handler on Windows; path-normalization fixes |
+| `src/borg/archive.py` | Forward-slash hardlink source handling; Windows-aware extract security checks |
 | `src/borg/helpers/fs.py` | `make_path_safe` drive-letter to path-component conversion |
 | `src/borg/patterns.py`, `shellpattern.py` | Forward-slash pattern matching on Windows |
 | `setup.py` | MSVC cflags, advapi32 linking, OpenSSL lib path |
@@ -97,9 +106,9 @@ $env:BORG_LIBLZ4_PREFIX = "C:\vcpkg\installed\x64-windows"
 $env:BORG_LIBZSTD_PREFIX = "C:\vcpkg\installed\x64-windows"
 $env:BORG_LIBXXHASH_PREFIX = "C:\vcpkg\installed\x64-windows"
 
-# The fork uses tags of the form v1.4.4-winN which current setuptools_scm
+# The fork uses tags of the form v1.4.5-winN which current setuptools_scm
 # rejects as non-PEP440. Override the version explicitly for the build:
-$env:SETUPTOOLS_SCM_PRETEND_VERSION = "1.4.4+win7"
+$env:SETUPTOOLS_SCM_PRETEND_VERSION = "1.4.5+win1"
 
 # Install Python dependencies
 pip install -r requirements.d/development.txt
